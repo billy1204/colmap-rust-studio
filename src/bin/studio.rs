@@ -286,13 +286,25 @@ impl Studio {
             }
             if pipeline == PipelineKind::RtxDense {
                 return match rtx_pipeline::run_with_events(
-                    &exe, &images, &workspace, cancel, tx, stage_tx,
+                    &exe,
+                    &images,
+                    &workspace,
+                    cancel.clone(),
+                    tx,
+                    stage_tx,
                 )? {
                     rtx_pipeline::PipelineOutcome::Completed(result) => {
-                        let analyzed = result
-                            .models
-                            .first()
-                            .and_then(|model| metrics::analyze(&exe, model).ok());
+                        let analyzed = if let Some(model) = result.models.first() {
+                            match metrics::analyze(&exe, model, cancel.clone()) {
+                                Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
+                                Ok(metrics::AnalysisOutcome::Cancelled) => {
+                                    return Ok(JobResult::Cancelled);
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        };
                         Ok(JobResult::DenseSuccess {
                             models: result.models,
                             fused_clouds: result.fused_clouds,
@@ -326,9 +338,17 @@ impl Studio {
                 }
             };
             let _ = stage_tx.send(PipelineEvent::Finished(stage));
-            let analyzed = models
-                .first()
-                .and_then(|model| metrics::analyze(&exe, model).ok());
+            let analyzed = if let Some(model) = models.first() {
+                match metrics::analyze(&exe, model, cancel) {
+                    Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
+                    Ok(metrics::AnalysisOutcome::Cancelled) => {
+                        return Ok(JobResult::Cancelled);
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
             Ok(JobResult::SparseSuccess {
                 models,
                 metrics: analyzed,
@@ -615,7 +635,8 @@ impl Studio {
         }
     }
     fn draw(&mut self, ui: &mut egui::Ui) {
-        let busy = self.worker.is_some() || self.loader.is_some();
+        let busy =
+            self.worker.is_some() || self.loader.is_some() || self.diagnostics_worker.is_some();
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {

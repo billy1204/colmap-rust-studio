@@ -6,6 +6,18 @@ pub enum Outcome {
     Completed,
     Cancelled,
 }
+
+#[derive(Debug)]
+pub struct CapturedOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum CaptureOutcome {
+    Completed(CapturedOutput),
+    Cancelled,
+}
 pub fn execute(
     command: &mut Command,
     log: &Path,
@@ -24,6 +36,86 @@ pub fn execute_append(
     events: SyncSender<String>,
 ) -> Result<Outcome, String> {
     execute_with_mode(command, log, cancel, events, true)
+}
+
+/// Run a short helper process under the same owned Windows Job Object used by
+/// reconstruction jobs, while retaining its output for parsing.
+pub fn capture(
+    command: &mut Command,
+    cancel: Arc<AtomicBool>,
+    timeout: std::time::Duration,
+) -> Result<CaptureOutcome, String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(CaptureOutcome::Cancelled);
+    }
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut guard = OwnedChild::attach(child)?;
+    let mut stdout = guard.child.stdout.take().ok_or("Missing stdout pipe")?;
+    let mut stderr = guard.child.stderr.take().ok_or("Missing stderr pipe")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let mut cancelled = false;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = guard.child.try_wait().map_err(|e| e.to_string())? {
+            guard.close_job();
+            break status;
+        }
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+        } else if Instant::now() >= deadline {
+            timed_out = true;
+        }
+        if cancelled || timed_out {
+            guard.close_job();
+            let _ = guard.child.kill();
+            break guard.child.wait().map_err(|e| e.to_string())?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Stdout reader panicked".to_string())?
+        .map_err(|e| e.to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Stderr reader panicked".to_string())?
+        .map_err(|e| e.to_string())?;
+    if cancelled {
+        return Ok(CaptureOutcome::Cancelled);
+    }
+    if timed_out {
+        return Err(format!(
+            "Helper process timed out after {}s",
+            timeout.as_secs()
+        ));
+    }
+    if !status.success() {
+        return Err(format!(
+            "Helper process exited with {status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    Ok(CaptureOutcome::Completed(CapturedOutput { stdout, stderr }))
 }
 
 fn execute_with_mode(
@@ -267,6 +359,36 @@ mod tests {
         assert!(combined.contains("NEXT PIPELINE STAGE"));
         assert!(execute(&mut cmd, &success, Arc::new(AtomicBool::new(false)), tx).is_err());
         std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn capture_owns_output_and_honors_pre_cancel() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "echo captured-out & echo captured-err 1>&2"]);
+        let captured = capture(
+            &mut command,
+            cancel.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let CaptureOutcome::Completed(output) = captured else {
+            panic!("capture unexpectedly cancelled");
+        };
+        assert!(String::from_utf8_lossy(&output.stdout).contains("captured-out"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("captured-err"));
+
+        cancel.store(true, Ordering::SeqCst);
+        let mut never_started = Command::new("nonexistent-program.exe");
+        assert!(matches!(
+            capture(
+                &mut never_started,
+                cancel,
+                std::time::Duration::from_secs(5)
+            )
+            .unwrap(),
+            CaptureOutcome::Cancelled
+        ));
     }
     #[test]
     fn pre_cancel_never_spawns_or_creates_log() {

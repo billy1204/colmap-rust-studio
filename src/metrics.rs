@@ -1,6 +1,10 @@
 use std::env;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, atomic::AtomicBool};
+use std::time::Duration;
+
+use crate::job;
 
 #[derive(Clone, Debug, Default)]
 pub struct ModelMetrics {
@@ -9,6 +13,11 @@ pub struct ModelMetrics {
     pub observations: Option<u64>,
     pub mean_track_length: Option<f64>,
     pub mean_reprojection_error_px: Option<f64>,
+}
+
+pub enum AnalysisOutcome {
+    Completed(ModelMetrics),
+    Cancelled,
 }
 
 pub fn parse(text: &str) -> ModelMetrics {
@@ -35,7 +44,11 @@ pub fn parse(text: &str) -> ModelMetrics {
     metrics
 }
 
-pub fn analyze(colmap: &Path, model: &Path) -> Result<ModelMetrics, String> {
+pub fn analyze(
+    colmap: &Path,
+    model: &Path,
+    cancel: Arc<AtomicBool>,
+) -> Result<AnalysisOutcome, String> {
     let mut command = Command::new(colmap);
     command.args(["model_analyzer", "--path"]);
     command.arg(model);
@@ -51,16 +64,16 @@ pub fn analyze(colmap: &Path, model: &Path) -> Result<ModelMetrics, String> {
             command.env("QT_PLUGIN_PATH", root.join("plugins"));
         }
     }
-    let output = command.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(format!("model_analyzer exited with {}", output.status));
-    }
+    let output = match job::capture(&mut command, cancel, Duration::from_secs(30))? {
+        job::CaptureOutcome::Completed(output) => output,
+        job::CaptureOutcome::Cancelled => return Ok(AnalysisOutcome::Cancelled),
+    };
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(parse(&text))
+    Ok(AnalysisOutcome::Completed(parse(&text)))
 }
 #[cfg(test)]
 mod tests {

@@ -94,9 +94,19 @@ pub fn apply_stage_event(stages: &mut [StageView], event: PipelineEvent) {
         .iter()
         .position(|stage| stage.base_label == base_label)
     {
-        stages[index].label = model
+        let next_label = model
             .map(|model| format!("{} — {model}", stages[index].base_label))
             .unwrap_or_else(|| stages[index].base_label.clone());
+        if matches!(status, StageStatus::Running)
+            && model.is_some()
+            && stages[index].label != next_label
+        {
+            for stage in &mut stages[index..] {
+                stage.status = StageStatus::Pending;
+                stage.label = stage.base_label.clone();
+            }
+        }
+        stages[index].label = next_label;
         stages[index].status = status;
         if terminal {
             for stage in &mut stages[index + 1..] {
@@ -163,5 +173,39 @@ mod tests {
             PipelineEvent::Finished("Model 0: CUDA PatchMatch stereo".into()),
         );
         assert_eq!(stages[4].status, StageStatus::Complete);
+    }
+
+    #[test]
+    fn later_model_failure_does_not_leave_prior_fusion_marked_complete() {
+        let mut stages = initial_stages(PipelineKind::RtxDense);
+        for label in [
+            "Model 0: Image undistortion",
+            "Model 0: CUDA PatchMatch stereo",
+            "Model 0: CPU dense point fusion",
+        ] {
+            apply_stage_event(&mut stages, PipelineEvent::Started(label.into()));
+            apply_stage_event(&mut stages, PipelineEvent::Finished(label.into()));
+        }
+        assert_eq!(stages[5].status, StageStatus::Complete);
+
+        apply_stage_event(
+            &mut stages,
+            PipelineEvent::Started("Model 1: Image undistortion".into()),
+        );
+        assert_eq!(stages[5].status, StageStatus::Pending);
+        apply_stage_event(
+            &mut stages,
+            PipelineEvent::Finished("Model 1: Image undistortion".into()),
+        );
+        apply_stage_event(
+            &mut stages,
+            PipelineEvent::Started("Model 1: CUDA PatchMatch stereo".into()),
+        );
+        apply_stage_event(
+            &mut stages,
+            PipelineEvent::Failed("Model 1: CUDA PatchMatch stereo".into()),
+        );
+        assert_eq!(stages[4].status, StageStatus::Failed);
+        assert_eq!(stages[5].status, StageStatus::Skipped);
     }
 }

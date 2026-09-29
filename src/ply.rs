@@ -192,11 +192,14 @@ fn selected(index: u64, count: u64, keep: u64, retained: usize) -> bool {
     next < keep && (keep == 1 || index == next * (count - 1) / (keep - 1))
 }
 
-fn fields(values: impl Iterator<Item = (String, f64)>) -> Result<([f64; 3], [u8; 3]), String> {
+fn fields<'a>(
+    values: impl Iterator<Item = Result<(&'a str, f64), String>>,
+) -> Result<([f64; 3], [u8; 3]), String> {
     let mut xyz = [None; 3];
     let mut rgb = [190u8; 3];
-    for (name, value) in values {
-        match name.as_str() {
+    for value in values {
+        let (name, value) = value?;
+        match name {
             "x" => xyz[0] = Some(value),
             "y" => xyz[1] = Some(value),
             "z" => xyz[2] = Some(value),
@@ -249,16 +252,12 @@ fn load_binary(
             .read_exact(&mut record)
             .map_err(|_| "Truncated PLY vertex data")?;
         let mut offset = 0usize;
-        let mut values = Vec::with_capacity(header.properties.len());
-        for property in &header.properties {
+        let point = fields(header.properties.iter().map(|property| {
             let end = offset + property.scalar.size();
-            values.push((
-                property.name.clone(),
-                property.scalar.binary(&record[offset..end]),
-            ));
+            let value = property.scalar.binary(&record[offset..end]);
             offset = end;
-        }
-        let point = fields(values.into_iter())?;
+            Ok((property.name.as_str(), value))
+        }))?;
         if selected(index, header.count, keep, retained.len()) {
             retained.push(point);
         }
@@ -305,22 +304,19 @@ fn load_ascii(
             return Err("Truncated ASCII PLY vertex data".into());
         }
         let text = std::str::from_utf8(&line).map_err(|_| "ASCII PLY vertex data is not UTF-8")?;
-        let tokens: Vec<_> = text.split_whitespace().collect();
-        if tokens.len() != header.properties.len() {
+        let mut tokens = text.split_whitespace();
+        let point = fields(header.properties.iter().map(|property| {
+            let token = tokens
+                .next()
+                .ok_or_else(|| "ASCII PLY vertex field count is invalid".to_owned())?;
+            token
+                .parse::<f64>()
+                .map(|value| (property.name.as_str(), value))
+                .map_err(|_| "Invalid ASCII PLY scalar".to_owned())
+        }))?;
+        if tokens.next().is_some() {
             return Err("ASCII PLY vertex field count is invalid".into());
         }
-        let values = header
-            .properties
-            .iter()
-            .zip(tokens)
-            .map(|(property, token)| {
-                token
-                    .parse::<f64>()
-                    .map(|value| (property.name.clone(), value))
-                    .map_err(|_| "Invalid ASCII PLY scalar".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let point = fields(values.into_iter())?;
         if selected(index, header.count, keep, retained.len()) {
             retained.push(point);
         }
