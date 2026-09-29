@@ -1,0 +1,45 @@
+# COLMAP Rust Studio — GUI preview build
+
+## Open
+Double-click `colmap-studio.exe` in your launcher folder (for example,
+`%USERPROFILE%\Desktop\COLMAP Rust Launcher`).
+The original `colmap-launcher.exe` remains available separately.
+
+## Included
+- Native Rust/egui window with photo selection, project naming, output-parent selection, and the COLMAP path under Advanced settings.
+- Background sparse reconstruction, bounded on-screen logs and full run.log on disk.
+- Explicit `Quick Sparse Preview` and `RTX Dense Point Cloud` pipeline cards. Dense mode uses CUDA SIFT extraction/matching and CUDA PatchMatch stereo on GPU 0, then CPU mapping/fusion. Output is `dense/<model>/fused.ply`.
+- Start and Cancel controls. Cancel force-stops the owned COLMAP job; it does not save a resumable checkpoint. Partial files remain, and cannot be reused automatically.
+- Windows Job Object cleanup and child-process wait on cancellation / window close.
+- Native sparse `points3D.bin` and dense ASCII/binary-little-endian `fused.ply` loading; colored 3D point preview, Sparse/Dense switch, left-drag orbit, right-drag pan, scroll zoom, point-size slider, and Reset view.
+- The preview retains up to 100,000 deterministically sampled points and rejects malformed/truncated files. Input files exceeding 10 million declared points are not supported by this preview.
+- No percentages or speedup claims. Engine remains COLMAP.
+- Named real stages, dense disk-space preflight, completion metrics/actions, hidden-by-default technical logs, atomic recent-project settings, and a compatibility check for COLMAP, plugins, NVIDIA GPU/VRAM, driver, and project-volume disk space.
+
+## Try the existing result first
+Choose Open existing point cloud and select:
+`%USERPROFILE%\Documents\COLMAP Tests\rust-launcher-test-01\sparse\0\points3D.bin`
+
+The launch copy was visually verified rendering all 17,461 retained points from this model. This verifies loading/rendering, not fresh GUI reconstruction.
+
+## Run photos
+The defaults point to the installed COLMAP and downloaded South Building sample. Workspace defaults to a new timestamped folder. Click Start reconstruction; the preview should load the first resulting sparse model after successful completion. Additional models can be opened separately.
+After any run, choose New workspace name before starting again. Never use the photo folder as workspace.
+
+## Verification status — important
+- 40 routine automated tests passed: input validation, workspace protection, pipeline command construction, stage state, logging, cancellation, defensive sparse/dense parsing, deterministic sampling, metrics, settings, diagnostics parsing, project naming, projection math, and GUI error handling.
+- cargo fmt --check and cargo clippy --features gui --all-targets -- -D warnings passed.
+- Release executable built and desktop copy checksum verified.
+- The quick sparse GUI path and live COLMAP cancellation were manually verified earlier.
+- The RTX pipeline completed the 128-photo South Building dataset in a fresh workspace. It produced 128 depth maps, 128 normal maps, and an 88,238,408-byte `fused.ply` containing 3,268,080 vertices. The run log confirms SIFT GPU extraction, SIFT matching bound to GPU 0, and CUDA PatchMatch with GPU index 0.
+
+## Build
+```text
+cargo test --features gui
+cargo fmt --check
+cargo clippy --features gui --all-targets -- -D warnings
+cargo build --release --features gui --bin colmap-studio
+```
+
+## Limitations
+This remains a point-cloud application, not a mesh/texturing tool. There are no connected surfaces, photo textures, resumable checkpoints, camera-frustum overlays, or installer. Cancellation is forceful. On-screen technical logs are bounded and may skip lines under heavy output; the complete disk log is preserved. Recent projects save only small path/pipeline metadata. The source directory and commercial licensing obligations remain documented in the original README.
