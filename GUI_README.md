@@ -1,4 +1,4 @@
-# COLMAP Rust Studio — GUI preview build
+# COLMAP Rust Studio — current GUI
 
 ## Open
 Double-click `colmap-studio.exe` in your launcher folder (for example,
@@ -34,6 +34,8 @@ After any run, choose New workspace name before starting again. Never use the ph
 - Release executable built and desktop copy checksum verified.
 - The quick sparse GUI path and live COLMAP cancellation were manually verified earlier.
 - The RTX pipeline completed the 128-photo South Building dataset in a fresh workspace. It produced 128 depth maps, 128 normal maps, and an 88,238,408-byte `fused.ply` containing 3,268,080 vertices. The run log confirms SIFT GPU extraction, SIFT matching bound to GPU 0, and CUDA PatchMatch with GPU index 0.
+- The verified system uses an NVIDIA GeForce RTX 5050 with driver 617.14 and CUDA driver capability 13.4.
+- The installed COLMAP 4.2.0 CUDA build performs the GPU stages above, but its Ceres library lacks CUDA/cuDSS and Caspar is disabled, so mapping bundle adjustment remains on CPU. COLMAP 4.2.1 or newer is recommended; GPU bundle adjustment requires a compatible custom build.
 
 ## Build
 ```text
