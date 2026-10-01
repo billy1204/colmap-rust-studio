@@ -15,6 +15,7 @@ The original `colmap-launcher.exe` remains available separately.
 - The preview retains up to 100,000 deterministically sampled points and rejects malformed/truncated files. Input files exceeding 10 million declared points are not supported by this preview.
 - No percentages or speedup claims. Engine remains COLMAP.
 - Named real stages, dense disk-space preflight, completion metrics/actions, hidden-by-default technical logs, atomic recent-project settings, and a compatibility check for COLMAP, plugins, NVIDIA GPU/VRAM, driver, and project-volume disk space.
+- Exclusive per-run workspace claims, preserved backups for malformed settings, native Windows path arguments, and visible warnings when optional model metrics cannot be collected.
 
 ## Try the existing result first
 Choose Open existing point cloud and select:
@@ -27,8 +28,9 @@ The defaults point to the installed COLMAP and downloaded South Building sample.
 After any run, choose New workspace name before starting again. Never use the photo folder as workspace.
 
 ## Verification status — important
-- 40 routine automated tests passed: input validation, workspace protection, pipeline command construction, stage state, logging, cancellation, defensive sparse/dense parsing, deterministic sampling, metrics, settings, diagnostics parsing, project naming, projection math, and GUI error handling.
+- 50 routine automated tests passed: input validation, exclusive workspace claims, pipeline command construction, native Windows paths, stage state, logging, cancellation, defensive sparse/dense parsing, deterministic sampling, metrics, recoverable settings, diagnostics parsing, project naming, projection math, and GUI error handling.
 - cargo fmt --check and cargo clippy --features gui --all-targets -- -D warnings passed.
+- Windows GitHub Actions now enforces formatting, tests, Clippy, and release builds on pushes and pull requests.
 - Release executable built and desktop copy checksum verified.
 - The quick sparse GUI path and live COLMAP cancellation were manually verified earlier.
 - The RTX pipeline completed the 128-photo South Building dataset in a fresh workspace. It produced 128 depth maps, 128 normal maps, and an 88,238,408-byte `fused.ply` containing 3,268,080 vertices. The run log confirms SIFT GPU extraction, SIFT matching bound to GPU 0, and CUDA PatchMatch with GPU index 0.

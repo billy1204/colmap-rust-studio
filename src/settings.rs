@@ -24,6 +24,12 @@ pub struct Settings {
     pub recent: Vec<RecentProject>,
 }
 
+pub struct SettingsLoad {
+    pub settings: Settings,
+    pub warning: Option<String>,
+    pub save_allowed: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SettingsFile {
     version: u32,
@@ -82,6 +88,40 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         install: file.install,
         recent: file.recent.into_iter().take(MAX_RECENT).collect(),
     })
+}
+
+pub fn load_recovering(path: &Path) -> SettingsLoad {
+    match load(path) {
+        Ok(settings) => SettingsLoad {
+            settings,
+            warning: None,
+            save_allowed: true,
+        },
+        Err(error) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let backup = path.with_file_name(format!("settings.invalid-{stamp}.json"));
+            match fs::rename(path, &backup) {
+                Ok(()) => SettingsLoad {
+                    settings: Settings::default(),
+                    warning: Some(format!(
+                        "Settings were invalid ({error}); the original was preserved as {}",
+                        backup.display()
+                    )),
+                    save_allowed: true,
+                },
+                Err(backup_error) => SettingsLoad {
+                    settings: Settings::default(),
+                    warning: Some(format!(
+                        "Settings were invalid ({error}) and could not be backed up ({backup_error}); settings changes will not be saved"
+                    )),
+                    save_allowed: false,
+                },
+            }
+        }
+    }
 }
 
 fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
@@ -145,5 +185,31 @@ mod tests {
         assert_eq!(read.install, s.install);
         assert_eq!(read.recent, s.recent);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_settings_are_backed_up_before_recovery() {
+        let directory = std::env::temp_dir().join(format!(
+            "colmap-settings-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.json");
+        fs::write(&path, b"not json").unwrap();
+        let loaded = load_recovering(&path);
+        assert!(loaded.warning.is_some());
+        assert!(loaded.save_allowed);
+        assert!(!path.exists());
+        let backups: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"not json");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

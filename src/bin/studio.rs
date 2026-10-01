@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use colmap_launcher::{
-    diagnostics, job, metrics, orbit, ply, point_cloud, preflight, reconstruction_command,
-    rtx_pipeline, settings, sparse_models,
+    claim_workspace, diagnostics, job, metrics, orbit, ply, point_cloud, preflight,
+    reconstruction_command, rtx_pipeline, settings, sparse_models,
     studio_support::{
         PipelineEvent, PipelineKind, StageStatus, StageView, apply_stage_event, initial_stages,
     },
@@ -22,11 +22,13 @@ enum JobResult {
     SparseSuccess {
         models: Vec<PathBuf>,
         metrics: Option<metrics::ModelMetrics>,
+        metrics_error: Option<String>,
     },
     DenseSuccess {
         models: Vec<PathBuf>,
         fused_clouds: Vec<PathBuf>,
         metrics: Option<metrics::ModelMetrics>,
+        metrics_error: Option<String>,
     },
     Cancelled,
 }
@@ -35,6 +37,7 @@ struct RunSummary {
     pipeline: PipelineKind,
     model_count: usize,
     metrics: Option<metrics::ModelMetrics>,
+    metrics_error: Option<String>,
     dense_points: Option<u64>,
     dense_bytes: Option<u64>,
     elapsed: Duration,
@@ -71,6 +74,7 @@ struct Studio {
     summary: Option<RunSummary>,
     show_technical_log: bool,
     settings: settings::Settings,
+    settings_save_allowed: bool,
     diagnostics_worker: Option<JoinHandle<diagnostics::DiagnosticReport>>,
     diagnostics: Option<diagnostics::DiagnosticReport>,
     closing: bool,
@@ -80,7 +84,10 @@ impl Default for Studio {
         let home = PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default());
         let samples = home.join("Documents").join("COLMAP Tests");
         let initial_workspace = fresh_workspace(&samples);
-        let saved = settings::load(&settings::default_path()).unwrap_or_default();
+        let loaded_settings = settings::load_recovering(&settings::default_path());
+        let settings_warning = loaded_settings.warning;
+        let settings_save_allowed = loaded_settings.save_allowed;
+        let saved = loaded_settings.settings;
         let install = if saved.install.as_os_str().is_empty() {
             home.join("Desktop").join("colmap")
         } else {
@@ -101,7 +108,8 @@ impl Default for Studio {
                 .and_then(|name| name.to_str())
                 .unwrap_or("new-project")
                 .to_owned(),
-            status: "Ready — choose photos or open an existing model".into(),
+            status: settings_warning
+                .unwrap_or_else(|| "Ready — choose photos or open an existing model".into()),
             worker: None,
             events: None,
             stage_events: None,
@@ -126,6 +134,7 @@ impl Default for Studio {
             summary: None,
             show_technical_log: false,
             settings: saved,
+            settings_save_allowed,
             diagnostics_worker: None,
             diagnostics: None,
             closing: false,
@@ -281,34 +290,40 @@ impl Studio {
                     ));
                 }
             }
-            if !workspace.exists() {
-                std::fs::create_dir(&workspace).map_err(|e| e.to_string())?;
-            }
+            let _workspace_claim = claim_workspace(&workspace)?;
             if pipeline == PipelineKind::RtxDense {
                 return match rtx_pipeline::run_with_events(
                     &exe,
                     &images,
                     &workspace,
                     cancel.clone(),
-                    tx,
+                    tx.clone(),
                     stage_tx,
                 )? {
                     rtx_pipeline::PipelineOutcome::Completed(result) => {
-                        let analyzed = if let Some(model) = result.models.first() {
+                        let (analyzed, metrics_error) = if let Some(model) = result.models.first() {
                             match metrics::analyze(&exe, model, cancel.clone()) {
-                                Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
+                                Ok(metrics::AnalysisOutcome::Completed(metrics)) => {
+                                    (Some(metrics), None)
+                                }
                                 Ok(metrics::AnalysisOutcome::Cancelled) => {
                                     return Ok(JobResult::Cancelled);
                                 }
-                                Err(_) => None,
+                                Err(error) => {
+                                    let _ = tx.try_send(format!(
+                                        "Metrics warning: model analysis was unavailable: {error}"
+                                    ));
+                                    (None, Some(error))
+                                }
                             }
                         } else {
-                            None
+                            (None, None)
                         };
                         Ok(JobResult::DenseSuccess {
                             models: result.models,
                             fused_clouds: result.fused_clouds,
                             metrics: analyzed,
+                            metrics_error,
                         })
                     }
                     rtx_pipeline::PipelineOutcome::Cancelled => Ok(JobResult::Cancelled),
@@ -318,14 +333,18 @@ impl Studio {
             let _ = stage_tx.send(PipelineEvent::Started(stage.clone()));
             let mut command = reconstruction_command(&exe, &images, &workspace);
             command.current_dir(&workspace);
-            let result =
-                match job::execute(&mut command, &workspace.join("run.log"), cancel.clone(), tx) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let _ = stage_tx.send(PipelineEvent::Failed(stage));
-                        return Err(error);
-                    }
-                };
+            let result = match job::execute(
+                &mut command,
+                &workspace.join("run.log"),
+                cancel.clone(),
+                tx.clone(),
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = stage_tx.send(PipelineEvent::Failed(stage));
+                    return Err(error);
+                }
+            };
             if result == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
                 let _ = stage_tx.send(PipelineEvent::Cancelled(stage));
                 return Ok(JobResult::Cancelled);
@@ -338,20 +357,26 @@ impl Studio {
                 }
             };
             let _ = stage_tx.send(PipelineEvent::Finished(stage));
-            let analyzed = if let Some(model) = models.first() {
+            let (analyzed, metrics_error) = if let Some(model) = models.first() {
                 match metrics::analyze(&exe, model, cancel) {
-                    Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
+                    Ok(metrics::AnalysisOutcome::Completed(metrics)) => (Some(metrics), None),
                     Ok(metrics::AnalysisOutcome::Cancelled) => {
                         return Ok(JobResult::Cancelled);
                     }
-                    Err(_) => None,
+                    Err(error) => {
+                        let _ = tx.try_send(format!(
+                            "Metrics warning: model analysis was unavailable: {error}"
+                        ));
+                        (None, Some(error))
+                    }
                 }
             } else {
-                None
+                (None, None)
             };
             Ok(JobResult::SparseSuccess {
                 models,
                 metrics: analyzed,
+                metrics_error,
             })
         }));
     }
@@ -451,12 +476,17 @@ impl Studio {
                 .join()
                 .unwrap_or_else(|_| Err("Background worker panicked".into()))
             {
-                Ok(JobResult::SparseSuccess { models, metrics }) => {
+                Ok(JobResult::SparseSuccess {
+                    models,
+                    metrics,
+                    metrics_error,
+                }) => {
                     self.status = format!("Complete — {} sparse model(s) saved", models.len());
                     self.summary = Some(RunSummary {
                         pipeline: PipelineKind::QuickSparse,
                         model_count: models.len(),
                         metrics,
+                        metrics_error,
                         dense_points: None,
                         dense_bytes: None,
                         elapsed: self.elapsed,
@@ -473,6 +503,7 @@ impl Studio {
                     models,
                     fused_clouds,
                     metrics,
+                    metrics_error,
                 }) => {
                     self.dense_output = fused_clouds.first().cloned();
                     self.sparse_output = models.first().map(|model| model.join("points3D.bin"));
@@ -487,6 +518,7 @@ impl Studio {
                         pipeline: PipelineKind::RtxDense,
                         model_count: models.len(),
                         metrics,
+                        metrics_error,
                         dense_points,
                         dense_bytes,
                         elapsed: self.elapsed,
@@ -573,7 +605,13 @@ impl Studio {
                 .unwrap_or_default()
                 .as_secs(),
         });
-        if let Err(error) = settings::save_atomic(&settings::default_path(), &self.settings) {
+        if !self.settings_save_allowed {
+            self.logs.push_back(
+                "Settings warning: existing invalid settings could not be preserved, so no settings were saved"
+                    .into(),
+            );
+        } else if let Err(error) = settings::save_atomic(&settings::default_path(), &self.settings)
+        {
             self.logs.push_back(format!("Settings warning: {error}"));
         }
     }
@@ -810,6 +848,9 @@ impl Studio {
                             ui.label(format!("Registered photos{suffix}")); ui.label(metrics.registered_images.map_or_else(|| "—".into(), |v| v.to_string())); ui.end_row();
                             ui.label(format!("Sparse points{suffix}")); ui.label(metrics.points.map_or_else(|| "—".into(), |v| v.to_string())); ui.end_row();
                             ui.label(format!("Reprojection error{suffix}")); ui.label(metrics.mean_reprojection_error_px.map_or_else(|| "—".into(), |v| format!("{v:.3}px"))); ui.end_row();
+                        }
+                        if summary.metrics.is_none() && summary.metrics_error.is_some() {
+                            ui.label("Model metrics"); ui.colored_label(Color32::from_rgb(255, 180, 100), "Unavailable — see technical log"); ui.end_row();
                         }
                         if let Some(points) = summary.dense_points { ui.label(if summary.model_count > 1 { "Dense points (first model)" } else { "Dense points" }); ui.label(points.to_string()); ui.end_row(); }
                         if let Some(bytes) = summary.dense_bytes { ui.label(if summary.model_count > 1 { "Dense file (first model)" } else { "Dense file" }); ui.label(format_bytes(bytes)); ui.end_row(); }
@@ -1067,6 +1108,7 @@ mod tests {
             pipeline: PipelineKind::QuickSparse,
             model_count: 1,
             metrics: None,
+            metrics_error: None,
             dense_points: None,
             dense_bytes: None,
             elapsed: Duration::from_secs(2),

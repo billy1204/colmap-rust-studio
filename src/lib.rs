@@ -10,6 +10,56 @@ pub mod settings;
 pub mod studio_support;
 use std::path::Path;
 
+const WORKSPACE_LOCK: &str = ".colmap-studio.lock";
+
+pub struct WorkspaceClaim {
+    lock_path: std::path::PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Drop for WorkspaceClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Atomically claim a validated new or empty workspace for one launcher run.
+pub fn claim_workspace(workspace: &Path) -> Result<WorkspaceClaim, String> {
+    match std::fs::create_dir(workspace) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && workspace.is_dir() => {}
+        Err(error) => return Err(format!("Cannot create project folder: {error}")),
+    }
+    let lock_path = workspace.join(WORKSPACE_LOCK);
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "This project folder is already claimed by another launcher run".to_owned()
+            } else {
+                format!("Cannot claim project folder: {error}")
+            }
+        })?;
+    let claim = WorkspaceClaim {
+        lock_path,
+        _lock: lock,
+    };
+    for entry in std::fs::read_dir(workspace)
+        .map_err(|error| format!("Cannot inspect claimed project folder: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Cannot inspect project entry: {error}"))?;
+        if entry.file_name() != WORKSPACE_LOCK {
+            return Err(
+                "Workspace is not empty. Choose a new folder; existing work will not be overwritten."
+                    .into(),
+            );
+        }
+    }
+    Ok(claim)
+}
+
 pub fn validate_inputs(colmap: &Path, images: &Path, workspace: &Path) -> Result<(), String> {
     if !colmap.is_file() {
         return Err(format!("COLMAP executable not found: {}", colmap.display()));
@@ -333,6 +383,23 @@ mod tests {
             b"original"
         );
         assert!(validate_inputs(&exe, &images, &images.join("output")).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn workspace_claim_is_exclusive_and_preserves_existing_files() {
+        let base = fixture("workspace-claim");
+        let workspace = base.join("result");
+        let claim = claim_workspace(&workspace).unwrap();
+        assert!(workspace.join(WORKSPACE_LOCK).is_file());
+        assert!(claim_workspace(&workspace).is_err());
+        drop(claim);
+        assert!(!workspace.join(WORKSPACE_LOCK).exists());
+
+        std::fs::write(workspace.join("keep.txt"), b"keep").unwrap();
+        assert!(claim_workspace(&workspace).is_err());
+        assert_eq!(std::fs::read(workspace.join("keep.txt")).unwrap(), b"keep");
+        assert!(!workspace.join(WORKSPACE_LOCK).exists());
         std::fs::remove_dir_all(base).unwrap();
     }
     #[test]

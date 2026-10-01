@@ -1,4 +1,6 @@
-use colmap_launcher::{reconstruction_command, run_logged, sparse_models, validate_inputs};
+use colmap_launcher::{
+    claim_workspace, reconstruction_command, run_logged, sparse_models, validate_inputs,
+};
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -107,9 +109,7 @@ fn run(interactive: bool) -> Result<(), String> {
         }
     }
     validate_inputs(&colmap, &images, &workspace)?;
-    if !workspace.exists() {
-        std::fs::create_dir(&workspace).map_err(|e| e.to_string())?;
-    }
+    let _workspace_claim = claim_workspace(&workspace)?;
     let log = workspace.join("run.log");
     let mut command = reconstruction_command(&colmap, &images, &workspace);
     command.current_dir(&workspace);

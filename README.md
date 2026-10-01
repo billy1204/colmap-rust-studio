@@ -23,6 +23,7 @@ In COLMAP use File > Import model and select the printed model folder (usually `
 
 ## Safety and limitations
 - Non-empty workspaces are refused. Use a new workspace for each run.
+- A per-run workspace claim prevents two launcher instances from using the same empty project folder concurrently.
 - Source photos and the COLMAP installation are not modified by the launcher.
 - `run.log` contains actual process output; percentages are not invented.
 - Failed runs retain logs and any partial results; nothing is automatically deleted.
@@ -48,6 +49,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
+
+The same formatting, test, Clippy, and release-build gates run on Windows in GitHub Actions for every push and pull request.
 
 The real-data integration test is opt-in because it runs COLMAP and creates output. Set COLMAP_TEST_INSTALL, COLMAP_TEST_IMAGES, and COLMAP_TEST_WORKSPACE (a fresh directory), then run:
 

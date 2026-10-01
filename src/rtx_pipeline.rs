@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -48,7 +49,7 @@ fn configured_command(colmap: &Path) -> Command {
     command
 }
 
-fn stage(colmap: &Path, name: &str, log_name: &str, args: Vec<String>) -> Stage {
+fn stage(colmap: &Path, name: &str, log_name: &str, args: Vec<OsString>) -> Stage {
     let mut command = configured_command(colmap);
     command.args(args);
     Stage {
@@ -59,9 +60,9 @@ fn stage(colmap: &Path, name: &str, log_name: &str, args: Vec<String>) -> Stage 
 }
 
 pub fn sparse_stages(colmap: &Path, images: &Path, workspace: &Path) -> Vec<Stage> {
-    let database = workspace.join("database.db").to_string_lossy().into_owned();
-    let images = images.to_string_lossy().into_owned();
-    let sparse = workspace.join("sparse").to_string_lossy().into_owned();
+    let database = workspace.join("database.db").into_os_string();
+    let images = images.as_os_str().to_os_string();
+    let sparse = workspace.join("sparse").into_os_string();
     vec![
         stage(
             colmap,
@@ -158,13 +159,13 @@ pub fn dense_stages(
     }
     numbered.sort_by_key(|(number, _)| *number);
 
-    let image_path = images.to_string_lossy().into_owned();
+    let image_path = images.as_os_str().to_os_string();
     let mut stages = Vec::with_capacity(numbered.len() * 3);
     for (number, model) in numbered {
         let dense = workspace.join("dense").join(number.to_string());
-        let model_path = model.to_string_lossy().into_owned();
-        let dense_path = dense.to_string_lossy().into_owned();
-        let fused = dense.join("fused.ply").to_string_lossy().into_owned();
+        let model_path = model.into_os_string();
+        let dense_path = dense.as_os_str().to_os_string();
+        let fused = dense.join("fused.ply").into_os_string();
         stages.push(stage(
             colmap,
             &format!("Model {number}: image undistortion"),
@@ -405,6 +406,28 @@ mod tests {
             stages
                 .iter()
                 .all(|s| s.command.get_envs().any(|(k, _)| k == "QT_PLUGIN_PATH"))
+        );
+    }
+
+    #[test]
+    fn preserves_non_unicode_windows_paths_in_command_arguments() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let unusual = OsString::from_wide(&[0xD800, b'x' as u16]);
+        let images = PathBuf::from(&unusual);
+        let workspace = PathBuf::from("C:/workspace").join(&unusual);
+        let expected_database = workspace.join("database.db");
+        let stages = sparse_stages(Path::new("C:/COLMAP/bin/colmap.exe"), &images, &workspace);
+        let arguments: Vec<_> = stages[0].command.get_args().collect();
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| *argument == images.as_os_str())
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| *argument == expected_database.as_os_str())
         );
     }
     #[test]

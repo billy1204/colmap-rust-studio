@@ -23,6 +23,7 @@ fn real_sample_reconstruction() {
     assert!(String::from_utf8_lossy(&result.stdout).contains("SUCCESS"));
     let work = std::path::Path::new(&workspace);
     assert!(work.join("run.log").is_file());
+    assert!(!work.join(".colmap-studio.lock").exists());
     assert!(!colmap_launcher::sparse_models(work).unwrap().is_empty());
 }
 
