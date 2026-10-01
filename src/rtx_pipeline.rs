@@ -8,7 +8,12 @@ use std::sync::{
     mpsc::{Sender, SyncSender},
 };
 
-use crate::{job, sparse_models, studio_support::PipelineEvent};
+use crate::{
+    job,
+    project::{PipelineId, Project, StageState},
+    sparse_models,
+    studio_support::PipelineEvent,
+};
 
 fn validate_fused_cloud(path: &Path) -> Result<u64, String> {
     crate::ply::load(path)
@@ -17,9 +22,75 @@ fn validate_fused_cloud(path: &Path) -> Result<u64, String> {
 }
 
 pub struct Stage {
+    pub id: String,
     pub name: String,
     pub log_name: String,
     pub command: Command,
+    output: StageOutput,
+}
+
+enum StageOutput {
+    Database(PathBuf),
+    SparseModel(PathBuf),
+    Undistorted(PathBuf),
+    PatchMatch(PathBuf),
+    Fused(PathBuf),
+}
+
+impl StageOutput {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Database(path) => nonempty_file(path, "COLMAP database"),
+            Self::SparseModel(workspace) => sparse_models(workspace).map(|_| ()),
+            Self::Undistorted(path) => {
+                nonempty_directory(&path.join("images"), "undistorted images")?;
+                nonempty_directory(&path.join("sparse"), "undistorted sparse model")?;
+                nonempty_file(
+                    &path.join("stereo").join("patch-match.cfg"),
+                    "PatchMatch configuration",
+                )
+            }
+            Self::PatchMatch(path) => {
+                nonempty_directory(
+                    &path.join("stereo").join("depth_maps"),
+                    "PatchMatch depth maps",
+                )?;
+                nonempty_directory(
+                    &path.join("stereo").join("normal_maps"),
+                    "PatchMatch normal maps",
+                )
+            }
+            Self::Fused(path) => validate_fused_cloud(path).map(|_| ()),
+        }
+    }
+}
+
+fn nonempty_file(path: &Path, description: &str) -> Result<(), String> {
+    if path
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Missing or empty {description}: {}",
+            path.display()
+        ))
+    }
+}
+
+fn nonempty_directory(path: &Path, description: &str) -> Result<(), String> {
+    let has_file = std::fs::read_dir(path).ok().is_some_and(|mut entries| {
+        entries.any(|entry| entry.is_ok_and(|entry| entry.path().is_file()))
+    });
+    if has_file {
+        Ok(())
+    } else {
+        Err(format!(
+            "Missing or empty {description}: {}",
+            path.display()
+        ))
+    }
 }
 
 pub struct PipelineResult {
@@ -49,13 +120,22 @@ fn configured_command(colmap: &Path) -> Command {
     command
 }
 
-fn stage(colmap: &Path, name: &str, log_name: &str, args: Vec<OsString>) -> Stage {
+fn stage(
+    colmap: &Path,
+    id: impl Into<String>,
+    name: &str,
+    log_name: &str,
+    args: Vec<OsString>,
+    output: StageOutput,
+) -> Stage {
     let mut command = configured_command(colmap);
     command.args(args);
     Stage {
+        id: id.into(),
         name: name.to_owned(),
         log_name: log_name.to_owned(),
         command,
+        output,
     }
 }
 
@@ -66,6 +146,7 @@ pub fn sparse_stages(colmap: &Path, images: &Path, workspace: &Path) -> Vec<Stag
     vec![
         stage(
             colmap,
+            "feature-extraction",
             "CUDA SIFT feature extraction",
             "01-feature-extractor.log",
             vec![
@@ -85,9 +166,11 @@ pub fn sparse_stages(colmap: &Path, images: &Path, workspace: &Path) -> Vec<Stag
                 "--SiftExtraction.max_num_features".into(),
                 "4096".into(),
             ],
+            StageOutput::Database(workspace.join("database.db")),
         ),
         stage(
             colmap,
+            "feature-matching",
             "CUDA exhaustive feature matching",
             "02-exhaustive-matcher.log",
             vec![
@@ -101,9 +184,11 @@ pub fn sparse_stages(colmap: &Path, images: &Path, workspace: &Path) -> Vec<Stag
                 "--FeatureMatching.gpu_index".into(),
                 "0".into(),
             ],
+            StageOutput::Database(workspace.join("database.db")),
         ),
         stage(
             colmap,
+            "sparse-mapping",
             "CPU sparse mapping and bundle adjustment",
             "03-mapper.log",
             vec![
@@ -129,6 +214,7 @@ pub fn sparse_stages(colmap: &Path, images: &Path, workspace: &Path) -> Vec<Stag
                 "--Mapper.ba_global_max_refinements".into(),
                 "2".into(),
             ],
+            StageOutput::SparseModel(workspace.to_path_buf()),
         ),
     ]
 }
@@ -168,6 +254,7 @@ pub fn dense_stages(
         let fused = dense.join("fused.ply").into_os_string();
         stages.push(stage(
             colmap,
+            format!("model-{number}-undistort"),
             &format!("Model {number}: image undistortion"),
             &format!("10-model-{number}-undistort.log"),
             vec![
@@ -185,9 +272,11 @@ pub fn dense_stages(
                 "--num_patch_match_src_images".into(),
                 "20".into(),
             ],
+            StageOutput::Undistorted(dense.clone()),
         ));
         stages.push(stage(
             colmap,
+            format!("model-{number}-patch-match"),
             &format!("Model {number}: CUDA PatchMatch stereo"),
             &format!("11-model-{number}-patch-match.log"),
             vec![
@@ -213,9 +302,11 @@ pub fn dense_stages(
                 "--PatchMatchStereo.num_iterations".into(),
                 "5".into(),
             ],
+            StageOutput::PatchMatch(dense.clone()),
         ));
         stages.push(stage(
             colmap,
+            format!("model-{number}-fusion"),
             &format!("Model {number}: dense point fusion"),
             &format!("12-model-{number}-fusion.log"),
             vec![
@@ -233,6 +324,7 @@ pub fn dense_stages(
                 "--StereoFusion.check_num_images".into(),
                 "33".into(),
             ],
+            StageOutput::Fused(dense.join("fused.ply")),
         ));
     }
     Ok(stages)
@@ -257,58 +349,43 @@ pub fn run_with_events(
     events: SyncSender<String>,
     control: Sender<PipelineEvent>,
 ) -> Result<PipelineOutcome, String> {
-    std::fs::create_dir(workspace.join("sparse")).map_err(|e| e.to_string())?;
+    let mut project = Project::open_or_create(workspace, images, colmap, PipelineId::RtxDense)?;
+    std::fs::create_dir_all(workspace.join("sparse")).map_err(|e| e.to_string())?;
     let log = workspace.join("run.log");
-    let mut first_stage = true;
     for mut stage in sparse_stages(colmap, images, workspace) {
-        let name = stage.name.clone();
-        let _ = control.send(PipelineEvent::Started(name.clone()));
-        let _ = events.try_send(format!("RTX pipeline — {}", stage.name));
-        stage.command.current_dir(workspace);
-        let executed = if first_stage {
-            first_stage = false;
-            job::execute(&mut stage.command, &log, cancel.clone(), events.clone())
-        } else {
-            job::execute_append(&mut stage.command, &log, cancel.clone(), events.clone())
-        };
-        let outcome = match executed {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = control.send(PipelineEvent::Failed(name));
-                return Err(error);
-            }
-        };
+        let outcome = run_stage(
+            &mut stage,
+            workspace,
+            &log,
+            &mut project,
+            cancel.clone(),
+            events.clone(),
+            &control,
+        )?;
         if outcome == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
-            let _ = control.send(PipelineEvent::Cancelled(name));
             return Ok(PipelineOutcome::Cancelled);
         }
-        let _ = control.send(PipelineEvent::Finished(name));
     }
 
     let models = sparse_models(workspace)?;
-    std::fs::create_dir(workspace.join("dense")).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(workspace.join("dense")).map_err(|e| e.to_string())?;
     for model in &models {
         let id = model.file_name().ok_or("Sparse model has no folder name")?;
-        std::fs::create_dir(workspace.join("dense").join(id)).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(workspace.join("dense").join(id)).map_err(|e| e.to_string())?;
     }
     for mut stage in dense_stages(colmap, images, workspace, &models)? {
-        let name = stage.name.clone();
-        let _ = control.send(PipelineEvent::Started(name.clone()));
-        let _ = events.try_send(format!("RTX pipeline — {}", stage.name));
-        stage.command.current_dir(workspace);
-        let outcome =
-            match job::execute_append(&mut stage.command, &log, cancel.clone(), events.clone()) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let _ = control.send(PipelineEvent::Failed(name));
-                    return Err(error);
-                }
-            };
+        let outcome = run_stage(
+            &mut stage,
+            workspace,
+            &log,
+            &mut project,
+            cancel.clone(),
+            events.clone(),
+            &control,
+        )?;
         if outcome == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
-            let _ = control.send(PipelineEvent::Cancelled(name));
             return Ok(PipelineOutcome::Cancelled);
         }
-        let _ = control.send(PipelineEvent::Finished(name));
     }
 
     let mut fused_clouds = Vec::with_capacity(models.len());
@@ -333,9 +410,70 @@ pub fn run_with_events(
     }))
 }
 
+fn run_stage(
+    stage: &mut Stage,
+    workspace: &Path,
+    log: &Path,
+    project: &mut Project,
+    cancel: Arc<AtomicBool>,
+    events: SyncSender<String>,
+    control: &Sender<PipelineEvent>,
+) -> Result<job::Outcome, String> {
+    stage.command.current_dir(workspace);
+    let name = stage.name.clone();
+    let fingerprint = project.stage_fingerprint(&stage.command);
+    if project.stage_complete(&stage.id, &fingerprint)? {
+        stage.output.validate().map_err(|error| {
+            format!(
+                "Saved stage '{}' is marked complete but its output is invalid: {error}",
+                stage.name
+            )
+        })?;
+        let _ = events.try_send(format!(
+            "Resuming project — reusing completed stage: {name}"
+        ));
+        let _ = control.send(PipelineEvent::Cached(name));
+        return Ok(job::Outcome::Completed);
+    }
+
+    project.set_stage(&stage.id, &fingerprint, StageState::Running)?;
+    let _ = control.send(PipelineEvent::Started(name.clone()));
+    let _ = events.try_send(format!("RTX pipeline — {name}"));
+    let executed = if log.is_file() {
+        job::execute_append(&mut stage.command, log, cancel, events)
+    } else {
+        job::execute(&mut stage.command, log, cancel, events)
+    };
+    let outcome = match executed {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let manifest = project.set_stage(&stage.id, &fingerprint, StageState::Failed);
+            let _ = control.send(PipelineEvent::Failed(name));
+            return match manifest {
+                Ok(()) => Err(error),
+                Err(manifest) => Err(format!("{error}; additionally, {manifest}")),
+            };
+        }
+    };
+    if outcome == job::Outcome::Cancelled {
+        project.set_stage(&stage.id, &fingerprint, StageState::Cancelled)?;
+        let _ = control.send(PipelineEvent::Cancelled(name));
+        return Ok(outcome);
+    }
+    if let Err(error) = stage.output.validate() {
+        project.set_stage(&stage.id, &fingerprint, StageState::Failed)?;
+        let _ = control.send(PipelineEvent::Failed(name.clone()));
+        return Err(format!("Stage '{name}' produced invalid output: {error}"));
+    }
+    project.set_stage(&stage.id, &fingerprint, StageState::Complete)?;
+    let _ = control.send(PipelineEvent::Finished(name));
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     fn args(s: &Stage) -> Vec<String> {
         s.command
             .get_args()
@@ -511,5 +649,80 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn completed_valid_stage_is_reused_without_touching_log() {
+        let base = std::env::temp_dir().join(format!(
+            "rtx-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let images = base.join("images");
+        let workspace = base.join("workspace");
+        let colmap = base.join("colmap.exe");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(images.join("one.jpg"), b"photo").unwrap();
+        std::fs::write(&colmap, b"engine").unwrap();
+        let database = workspace.join("database.db");
+        std::fs::write(&database, b"valid database fixture").unwrap();
+        let mut project =
+            Project::open_or_create(&workspace, &images, &colmap, PipelineId::RtxDense).unwrap();
+        let make_stage = || {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/C", "exit /b 0"]);
+            Stage {
+                id: "test-stage".into(),
+                name: "Test stage".into(),
+                log_name: "test.log".into(),
+                command,
+                output: StageOutput::Database(database.clone()),
+            }
+        };
+        let log = workspace.join("run.log");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (events_tx, _events_rx) = mpsc::sync_channel(16);
+        let (control_tx, control_rx) = mpsc::channel();
+        let mut first = make_stage();
+        assert_eq!(
+            run_stage(
+                &mut first,
+                &workspace,
+                &log,
+                &mut project,
+                cancel.clone(),
+                events_tx.clone(),
+                &control_tx,
+            )
+            .unwrap(),
+            job::Outcome::Completed
+        );
+        let first_len = std::fs::metadata(&log).unwrap().len();
+        while control_rx.try_recv().is_ok() {}
+
+        let mut second = make_stage();
+        assert_eq!(
+            run_stage(
+                &mut second,
+                &workspace,
+                &log,
+                &mut project,
+                cancel,
+                events_tx,
+                &control_tx,
+            )
+            .unwrap(),
+            job::Outcome::Completed
+        );
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), first_len);
+        assert!(matches!(
+            control_rx.recv().unwrap(),
+            PipelineEvent::Cached(_)
+        ));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

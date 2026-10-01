@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use colmap_launcher::{
-    claim_workspace, diagnostics, job, metrics, orbit, ply, point_cloud, preflight, progress,
+    claim_project_workspace, diagnostics, job, metrics, orbit, ply, point_cloud, preflight,
+    progress,
+    project::{PipelineId, Project, StageState},
     reconstruction_command, rtx_pipeline, settings, sparse_models, sparse_scene,
     studio_support::{
         PipelineEvent, PipelineKind, StageStatus, StageView, apply_stage_event, initial_stages,
     },
-    validate_inputs,
+    validate_project_inputs,
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
 use std::collections::VecDeque;
@@ -302,7 +304,7 @@ impl Studio {
         self.status = "Running — preparing reconstruction".into();
         let pipeline = self.pipeline;
         self.worker = Some(std::thread::spawn(move || {
-            validate_inputs(&exe, &images, &workspace)?;
+            validate_project_inputs(&exe, &images, &workspace)?;
             if cancel.load(Ordering::SeqCst) {
                 return Ok(JobResult::Cancelled);
             }
@@ -323,7 +325,7 @@ impl Studio {
                     ));
                 }
             }
-            let _workspace_claim = claim_workspace(&workspace)?;
+            let _workspace_claim = claim_project_workspace(&workspace)?;
             if pipeline == PipelineKind::RtxDense {
                 return match rtx_pipeline::run_with_events(
                     &exe,
@@ -363,22 +365,46 @@ impl Studio {
                 };
             }
             let stage = pipeline.stages()[0].to_owned();
-            let _ = stage_tx.send(PipelineEvent::Started(stage.clone()));
             let mut command = reconstruction_command(&exe, &images, &workspace);
             command.current_dir(&workspace);
-            let result = match job::execute(
-                &mut command,
-                &workspace.join("run.log"),
-                cancel.clone(),
-                tx.clone(),
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    let _ = stage_tx.send(PipelineEvent::Failed(stage));
-                    return Err(error);
+            let mut project =
+                Project::open_or_create(&workspace, &images, &exe, PipelineId::QuickSparse)?;
+            let fingerprint = project.stage_fingerprint(&command);
+            let completed = project.stage_complete("quick-sparse", &fingerprint)?;
+            let result = if completed {
+                sparse_models(&workspace).map_err(|error| {
+                    format!(
+                        "Saved sparse stage is marked complete but its output is invalid: {error}"
+                    )
+                })?;
+                let _ = tx
+                    .try_send("Resuming project — reusing completed sparse reconstruction".into());
+                let _ = stage_tx.send(PipelineEvent::Cached(stage.clone()));
+                job::Outcome::Completed
+            } else {
+                project.set_stage("quick-sparse", &fingerprint, StageState::Running)?;
+                let _ = stage_tx.send(PipelineEvent::Started(stage.clone()));
+                let log = workspace.join("run.log");
+                let executed = if log.is_file() {
+                    job::execute_append(&mut command, &log, cancel.clone(), tx.clone())
+                } else {
+                    job::execute(&mut command, &log, cancel.clone(), tx.clone())
+                };
+                match executed {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let manifest =
+                            project.set_stage("quick-sparse", &fingerprint, StageState::Failed);
+                        let _ = stage_tx.send(PipelineEvent::Failed(stage));
+                        return match manifest {
+                            Ok(()) => Err(error),
+                            Err(manifest) => Err(format!("{error}; additionally, {manifest}")),
+                        };
+                    }
                 }
             };
-            if result == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
+            if result == job::Outcome::Cancelled {
+                project.set_stage("quick-sparse", &fingerprint, StageState::Cancelled)?;
                 let _ = stage_tx.send(PipelineEvent::Cancelled(stage));
                 return Ok(JobResult::Cancelled);
             }
@@ -389,7 +415,10 @@ impl Studio {
                     return Err(error);
                 }
             };
-            let _ = stage_tx.send(PipelineEvent::Finished(stage));
+            if !completed {
+                project.set_stage("quick-sparse", &fingerprint, StageState::Complete)?;
+                let _ = stage_tx.send(PipelineEvent::Finished(stage));
+            }
             let (analyzed, metrics_error) = if let Some(model) = models.first() {
                 match metrics::analyze(&exe, model, cancel) {
                     Ok(metrics::AnalysisOutcome::Completed(metrics)) => (Some(metrics), None),
@@ -594,9 +623,19 @@ impl Studio {
                 }
                 Ok(JobResult::Cancelled) => {
                     self.status =
-                        "Cancelled — partial output retained; use a new workspace to retry".into()
+                        "Cancelled — partial output retained; start this project again to resume"
+                            .into();
+                    self.record_recent_project(self.pipeline);
                 }
-                Err(e) => self.status = format!("Error: {e}"),
+                Err(e) => {
+                    self.status = format!("Error: {e}");
+                    if Path::new(&self.workspace)
+                        .join(colmap_launcher::project::FILE_NAME)
+                        .is_file()
+                    {
+                        self.record_recent_project(self.pipeline);
+                    }
+                }
             }
         }
         if self.loader.as_ref().is_some_and(|w| w.is_finished()) {
@@ -727,7 +766,15 @@ impl Studio {
         } else {
             self.cloud = None;
             self.model_path = None;
-            self.status = "Project reopened — no completed point cloud found".into();
+            self.status = if project
+                .workspace
+                .join(colmap_launcher::project::FILE_NAME)
+                .is_file()
+            {
+                "Project reopened — incomplete output; start reconstruction to resume".into()
+            } else {
+                "Project reopened — no completed point cloud found".into()
+            };
         }
     }
     fn reveal_path(&mut self, path: PathBuf) {
@@ -821,7 +868,7 @@ impl Studio {
                             .unwrap_or("new-project")
                             .to_owned();
                     }
-                    ui.small("The project folder must be new or empty. Existing projects and source photos are never overwritten.");
+                    ui.small("Use a new folder or reopen a Rust Studio project. Matching completed stages are validated and reused; source photos are never overwritten.");
                     ui.add_space(8.0);
                     egui::CollapsingHeader::new("Advanced engine settings")
                         .default_open(false)
@@ -897,6 +944,7 @@ impl Studio {
                                 StageStatus::Pending => ("○", Color32::GRAY),
                                 StageStatus::Running => ("▶", Color32::from_rgb(124, 211, 230)),
                                 StageStatus::Complete => ("✓", Color32::from_rgb(150, 215, 190)),
+                                StageStatus::Cached => ("↻", Color32::from_rgb(150, 190, 235)),
                                 StageStatus::Failed => ("!", Color32::from_rgb(255, 130, 120)),
                                 StageStatus::Cancelled => ("■", Color32::from_rgb(235, 180, 100)),
                                 StageStatus::Skipped => ("–", Color32::DARK_GRAY),
@@ -916,7 +964,10 @@ impl Studio {
                         }
                     }
                     ui.add_space(14.0);
-                    if ui.add_sized([ui.available_width(), 42.0], egui::Button::new(RichText::new("Start reconstruction").strong())).clicked() { self.start(); }
+                    let can_resume = project_folder(Path::new(&self.output_parent), &self.project_name)
+                        .is_ok_and(|path| colmap_launcher::project::is_project_workspace(&path));
+                    let start_label = if can_resume { "Resume reconstruction" } else { "Start reconstruction" };
+                    if ui.add_sized([ui.available_width(), 42.0], egui::Button::new(RichText::new(start_label).strong())).clicked() { self.start(); }
                 });
                 if ui.add_enabled(self.worker.is_some() && !self.cancel.load(Ordering::SeqCst), egui::Button::new("Cancel reconstruction")).clicked() { self.cancel(); }
                 ui.small("Cancel first asks COLMAP to preserve resumable partial results, then force-stops after 10 seconds if needed.");

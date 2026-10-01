@@ -6,6 +6,7 @@ pub mod ply;
 pub mod point_cloud;
 pub mod preflight;
 pub mod progress;
+pub mod project;
 pub mod rtx_pipeline;
 pub mod settings;
 pub mod sparse_scene;
@@ -27,6 +28,18 @@ impl Drop for WorkspaceClaim {
 
 /// Atomically claim a validated new or empty workspace for one launcher run.
 pub fn claim_workspace(workspace: &Path) -> Result<WorkspaceClaim, String> {
+    claim_workspace_with_project(workspace, false)
+}
+
+/// Claim either a new workspace or an existing Rust Studio project.
+pub fn claim_project_workspace(workspace: &Path) -> Result<WorkspaceClaim, String> {
+    claim_workspace_with_project(workspace, true)
+}
+
+fn claim_workspace_with_project(
+    workspace: &Path,
+    allow_existing_project: bool,
+) -> Result<WorkspaceClaim, String> {
     match std::fs::create_dir(workspace) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && workspace.is_dir() => {}
@@ -48,21 +61,44 @@ pub fn claim_workspace(workspace: &Path) -> Result<WorkspaceClaim, String> {
         lock_path,
         _lock: lock,
     };
+    let mut has_content = false;
+    let mut has_project = false;
     for entry in std::fs::read_dir(workspace)
         .map_err(|error| format!("Cannot inspect claimed project folder: {error}"))?
     {
         let entry = entry.map_err(|error| format!("Cannot inspect project entry: {error}"))?;
         if entry.file_name() != WORKSPACE_LOCK {
-            return Err(
-                "Workspace is not empty. Choose a new folder; existing work will not be overwritten."
-                    .into(),
-            );
+            has_content = true;
+            has_project |= entry.file_name() == project::FILE_NAME;
         }
+    }
+    if has_content && (!allow_existing_project || !has_project) {
+        return Err(
+            "Workspace is not empty and is not a resumable Rust Studio project. Choose a new folder."
+                .into(),
+        );
     }
     Ok(claim)
 }
 
+pub fn validate_project_inputs(
+    colmap: &Path,
+    images: &Path,
+    workspace: &Path,
+) -> Result<(), String> {
+    validate_inputs_impl(colmap, images, workspace, true)
+}
+
 pub fn validate_inputs(colmap: &Path, images: &Path, workspace: &Path) -> Result<(), String> {
+    validate_inputs_impl(colmap, images, workspace, false)
+}
+
+fn validate_inputs_impl(
+    colmap: &Path,
+    images: &Path,
+    workspace: &Path,
+    allow_existing_project: bool,
+) -> Result<(), String> {
     if !colmap.is_file() {
         return Err(format!("COLMAP executable not found: {}", colmap.display()));
     }
@@ -98,8 +134,12 @@ pub fn validate_inputs(colmap: &Path, images: &Path, workspace: &Path) -> Result
             .map_err(|e| e.to_string())?
             .next()
             .is_some()
+            && !(allow_existing_project && project::is_project_workspace(workspace))
         {
-            return Err("Workspace is not empty. Choose a new folder; existing work will not be overwritten.".into());
+            return Err(
+                "Workspace is not empty. Choose a new folder or a resumable Rust Studio project."
+                    .into(),
+            );
         }
         workspace.canonicalize().map_err(|e| e.to_string())?
     } else {
@@ -401,6 +441,25 @@ mod tests {
         std::fs::write(workspace.join("keep.txt"), b"keep").unwrap();
         assert!(claim_workspace(&workspace).is_err());
         assert_eq!(std::fs::read(workspace.join("keep.txt")).unwrap(), b"keep");
+        assert!(!workspace.join(WORKSPACE_LOCK).exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn project_workspace_claim_allows_only_manifest_backed_resume() {
+        let base = fixture("project-workspace-claim");
+        let workspace = base.join("result");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("unexpected.txt"), b"keep").unwrap();
+        assert!(claim_project_workspace(&workspace).is_err());
+        assert_eq!(
+            std::fs::read(workspace.join("unexpected.txt")).unwrap(),
+            b"keep"
+        );
+        std::fs::write(workspace.join(project::FILE_NAME), b"{}").unwrap();
+        let claim = claim_project_workspace(&workspace).unwrap();
+        assert!(claim_project_workspace(&workspace).is_err());
+        drop(claim);
         assert!(!workspace.join(WORKSPACE_LOCK).exists());
         std::fs::remove_dir_all(base).unwrap();
     }

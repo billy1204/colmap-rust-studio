@@ -11,7 +11,9 @@ The original console launcher is still included as `colmap-launcher.exe`, but `c
 - `Quick Sparse Preview` and `RTX Dense Point Cloud` pipelines.
 - Background reconstruction with real COLMAP progress, bounded on-screen logs, and a complete `run.log` on disk.
 - Cooperative cancellation followed by a timed force-stop of the owned process tree when necessary.
-- Atomically persisted recent projects that can reopen completed sparse or dense outputs.
+- Versioned, atomically saved `project.json` manifests with strict photo, COLMAP, pipeline, and stage identity checks.
+- Safe automatic resume: completed stages are reused only when their fingerprints and outputs validate; interrupted stages retain append-only logs and can be restarted.
+- Persisted recent projects that can reopen completed output or resume interrupted work.
 - Interactive 3D point-cloud preview with colored points, camera frustums, image selection, orbit, pan, zoom, and sparse/dense switching.
 - Compatibility checks for COLMAP, NVIDIA GPU/VRAM, driver information, plugins, and available project-volume disk space.
 - Defensive readers for COLMAP sparse binary models and ASCII or binary little-endian PLY point clouds.
@@ -59,7 +61,7 @@ cargo clippy --features gui --all-targets -- -D warnings
 cargo build --release --features gui --bin colmap-studio
 ```
 
-GitHub Actions applies the same formatting, testing, Clippy, and release-build gates on Windows for pushes and pull requests. The routine GUI-enabled suite currently contains 56 passing tests. Hardware and real-data integration tests are opt-in because they run COLMAP and create reconstruction output.
+GitHub Actions applies the same formatting, testing, Clippy, and release-build gates on Windows for pushes and pull requests. The routine GUI-enabled suite currently contains 61 passing tests. Hardware and real-data integration tests are opt-in because they run COLMAP and create reconstruction output.
 
 Example real-data test configuration:
 
@@ -73,14 +75,14 @@ cargo test --release --features gui --test cli real_sample_reconstruction -- --i
 ## Current limitations
 
 - The preview displays point clouds and cameras, not connected meshes or photo textures.
-- Recent projects store paths and pipeline metadata; there is no portable project file or automatic resume workflow yet.
-- Cancellation preserves partial files when COLMAP exits cooperatively, but Rust Studio does not yet resume those files automatically.
+- Projects remain tied to the original photo folder and COLMAP executable. Changing either is rejected instead of silently reusing stale output.
+- Resume is stage-based. An interrupted COLMAP stage is rerun against its preserved workspace; completed stages are never trusted without output validation.
 - The preview retains at most 100,000 deterministically sampled points and rejects inputs declaring more than 10 million points.
 - COLMAP and its dependencies are installed and licensed separately; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Roadmap
 
-- Portable project manifests and automatic resume of interrupted work.
+- Project recovery controls for deliberately invalidating or restarting selected stages.
 - Optional GPU bundle adjustment when a compatible Ceres CUDA/cuDSS or Caspar build is detected.
 - Mesh generation, texture workflows, and richer source-image inspection.
 - Installer, signed releases, and automatic update support.

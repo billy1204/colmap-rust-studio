@@ -46,6 +46,7 @@ pub enum StageStatus {
     Pending,
     Running,
     Complete,
+    Cached,
     Failed,
     Cancelled,
     Skipped,
@@ -62,6 +63,7 @@ pub struct StageView {
 pub enum PipelineEvent {
     Started(String),
     Finished(String),
+    Cached(String),
     Failed(String),
     Cancelled(String),
 }
@@ -82,6 +84,7 @@ pub fn apply_stage_event(stages: &mut [StageView], event: PipelineEvent) {
     let (label, status, terminal) = match event {
         PipelineEvent::Started(label) => (label, StageStatus::Running, false),
         PipelineEvent::Finished(label) => (label, StageStatus::Complete, false),
+        PipelineEvent::Cached(label) => (label, StageStatus::Cached, false),
         PipelineEvent::Failed(label) => (label, StageStatus::Failed, true),
         PipelineEvent::Cancelled(label) => (label, StageStatus::Cancelled, true),
     };
@@ -97,7 +100,7 @@ pub fn apply_stage_event(stages: &mut [StageView], event: PipelineEvent) {
         let next_label = model
             .map(|model| format!("{} — {model}", stages[index].base_label))
             .unwrap_or_else(|| stages[index].base_label.clone());
-        if matches!(status, StageStatus::Running)
+        if matches!(status, StageStatus::Running | StageStatus::Cached)
             && model.is_some()
             && stages[index].label != next_label
         {
@@ -173,6 +176,16 @@ mod tests {
             PipelineEvent::Finished("Model 0: CUDA PatchMatch stereo".into()),
         );
         assert_eq!(stages[4].status, StageStatus::Complete);
+    }
+
+    #[test]
+    fn cached_stage_is_visible_as_reused_work() {
+        let mut stages = initial_stages(PipelineKind::RtxDense);
+        apply_stage_event(
+            &mut stages,
+            PipelineEvent::Cached("CUDA SIFT feature extraction".into()),
+        );
+        assert_eq!(stages[0].status, StageStatus::Cached);
     }
 
     #[test]
