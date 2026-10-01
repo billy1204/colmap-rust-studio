@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use colmap_launcher::{
-    claim_workspace, diagnostics, job, metrics, orbit, ply, point_cloud, preflight,
-    reconstruction_command, rtx_pipeline, settings, sparse_models,
+    claim_workspace, diagnostics, job, metrics, orbit, ply, point_cloud, preflight, progress,
+    reconstruction_command, rtx_pipeline, settings, sparse_models, sparse_scene,
     studio_support::{
         PipelineEvent, PipelineKind, StageStatus, StageView, apply_stage_event, initial_stages,
     },
@@ -43,6 +43,13 @@ struct RunSummary {
     elapsed: Duration,
     workspace: PathBuf,
 }
+
+struct PreviewData {
+    cloud: point_cloud::Cloud,
+    scene: Option<sparse_scene::Scene>,
+    scene_warning: Option<String>,
+}
+
 struct Studio {
     install: String,
     images: String,
@@ -59,16 +66,21 @@ struct Studio {
     started: Option<Instant>,
     elapsed: Duration,
     cloud: Option<point_cloud::Cloud>,
+    scene: Option<sparse_scene::Scene>,
     model_path: Option<PathBuf>,
     sparse_output: Option<PathBuf>,
-    loader: Option<JoinHandle<Result<point_cloud::Cloud, String>>>,
+    loader: Option<JoinHandle<Result<PreviewData, String>>>,
     yaw: f32,
     pitch: f32,
     zoom: f32,
     pan: Vec2,
     point_size: f32,
+    camera_size: f32,
+    show_cameras: bool,
+    selected_camera: Option<u32>,
     projected_cache: Vec<([f32; 3], [u8; 3])>,
     projection_dirty: bool,
+    progress: Option<progress::Update>,
     pipeline: PipelineKind,
     dense_output: Option<PathBuf>,
     summary: Option<RunSummary>,
@@ -119,6 +131,7 @@ impl Default for Studio {
             started: None,
             elapsed: Duration::ZERO,
             cloud: None,
+            scene: None,
             model_path: None,
             sparse_output: None,
             loader: None,
@@ -127,8 +140,12 @@ impl Default for Studio {
             zoom: 1.0,
             pan: Vec2::ZERO,
             point_size: 1.4,
+            camera_size: 0.035,
+            show_cameras: true,
+            selected_camera: None,
             projected_cache: Vec::new(),
             projection_dirty: true,
+            progress: None,
             pipeline: PipelineKind::QuickSparse,
             dense_output: None,
             summary: None,
@@ -198,6 +215,19 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn source_image_path(root: &Path, relative_name: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative_name);
+    relative
+        .components()
+        .all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+        .then(|| root.join(relative))
+}
+
 fn pipeline_card(ui: &mut egui::Ui, pipeline: PipelineKind, selected: PipelineKind) -> bool {
     let marker = if pipeline == PipelineKind::QuickSparse {
         "⚡"
@@ -260,10 +290,13 @@ impl Studio {
         self.stages = initial_stages(self.pipeline);
         self.logs.clear();
         self.cloud = None;
+        self.scene = None;
+        self.selected_camera = None;
         self.model_path = None;
         self.sparse_output = None;
         self.dense_output = None;
         self.summary = None;
+        self.progress = None;
         self.started = Some(Instant::now());
         self.elapsed = Duration::ZERO;
         self.status = "Running — preparing reconstruction".into();
@@ -409,6 +442,8 @@ impl Studio {
         };
         self.model_path = Some(file.clone());
         self.cloud = None;
+        self.scene = None;
+        self.selected_camera = None;
         self.status = if self.summary.is_some() {
             "Complete — output saved; loading point-cloud preview…".into()
         } else {
@@ -419,9 +454,23 @@ impl Studio {
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("ply"))
             {
-                ply::load(&file)
+                ply::load(&file).map(|cloud| PreviewData {
+                    cloud,
+                    scene: None,
+                    scene_warning: None,
+                })
             } else {
-                point_cloud::load(&file)
+                let cloud = point_cloud::load(&file)?;
+                let model = file.parent().ok_or("Sparse model path has no parent")?;
+                let (scene, scene_warning) = match sparse_scene::load(model) {
+                    Ok(scene) => (Some(scene), None),
+                    Err(error) => (None, Some(format!("Camera overlay unavailable: {error}"))),
+                };
+                Ok(PreviewData {
+                    cloud,
+                    scene,
+                    scene_warning,
+                })
             }
         }));
     }
@@ -438,7 +487,9 @@ impl Studio {
                 .join()
                 .ok();
             if let Some(report) = report {
-                self.status = if report.quick_ready() {
+                self.status = if report.quick_ready() && report.compatibility_warning.is_some() {
+                    "Compatibility check finished with a COLMAP version warning".into()
+                } else if report.quick_ready() {
                     "Compatibility check finished — COLMAP detected; review GPU and disk facts below".into()
                 } else {
                     "Compatibility check found a COLMAP installation problem".into()
@@ -449,7 +500,12 @@ impl Studio {
             }
         }
         if let Some(rx) = &self.events {
-            for line in rx.try_iter().take(1000) {
+            let lines: Vec<_> = rx.try_iter().take(1000).collect();
+            for line in lines {
+                if let Some(update) = progress::parse(&line) {
+                    self.status = format!("Running — {}", update.message());
+                    self.progress = Some(update);
+                }
                 if self.logs.len() >= 800 {
                     self.logs.pop_front();
                 }
@@ -461,6 +517,7 @@ impl Studio {
             for event in control {
                 if let PipelineEvent::Started(label) = &event {
                     self.status = format!("Running — {label}");
+                    self.progress = None;
                 }
                 apply_stage_event(&mut self.stages, event);
             }
@@ -469,6 +526,7 @@ impl Studio {
             self.elapsed = self.started.map(|s| s.elapsed()).unwrap_or_default();
         }
         if self.worker.as_ref().is_some_and(|w| w.is_finished()) {
+            self.progress = None;
             match self
                 .worker
                 .take()
@@ -549,7 +607,12 @@ impl Studio {
                 .join()
                 .unwrap_or_else(|_| Err("Preview loader panicked".into()))
             {
-                Ok(cloud) => {
+                Ok(preview_data) => {
+                    let PreviewData {
+                        cloud,
+                        scene,
+                        scene_warning,
+                    } = preview_data;
                     let kind = if self.model_path.as_ref().is_some_and(|path| {
                         path.extension()
                             .is_some_and(|extension| extension.eq_ignore_ascii_case("ply"))
@@ -558,8 +621,9 @@ impl Studio {
                     } else {
                         "sparse"
                     };
+                    let cameras = scene.as_ref().map_or(0, |scene| scene.cameras.len());
                     let preview = format!(
-                        "{} {kind} points ({} displayed)",
+                        "{} {kind} points ({} displayed), {cameras} cameras",
                         cloud.total_points,
                         cloud.points.len()
                     );
@@ -568,6 +632,13 @@ impl Studio {
                     } else {
                         format!("Preview ready — {preview}")
                     };
+                    if let Some(warning) = scene_warning {
+                        if self.logs.len() >= 800 {
+                            self.logs.pop_front();
+                        }
+                        self.logs.push_back(warning);
+                    }
+                    self.scene = scene;
                     self.cloud = Some(cloud);
                     self.projection_dirty = true;
                     self.reset_view();
@@ -777,6 +848,12 @@ impl Studio {
                                     if report.quick_ready() { "✓" } else { "!" },
                                     report.colmap_version.as_deref().unwrap_or("not detected")
                                 ));
+                                if let Some(warning) = &report.compatibility_warning {
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 180, 100),
+                                        format!("⚠ {warning}"),
+                                    );
+                                }
                                 ui.label(format!(
                                     "{} Qt plugins",
                                     if report.plugins_found { "✓ found" } else { "! missing" }
@@ -826,12 +903,23 @@ impl Studio {
                             };
                             ui.label(RichText::new(format!("{icon}  {}", stage.label)).color(color).size(11.0));
                         }
+                        if let Some(progress) = &self.progress {
+                            if let Some(fraction) = progress.fraction() {
+                                ui.add(
+                                    egui::ProgressBar::new(fraction)
+                                        .text(progress.message())
+                                        .animate(true),
+                                );
+                            } else {
+                                ui.small(progress.message());
+                            }
+                        }
                     }
                     ui.add_space(14.0);
                     if ui.add_sized([ui.available_width(), 42.0], egui::Button::new(RichText::new("Start reconstruction").strong())).clicked() { self.start(); }
                 });
                 if ui.add_enabled(self.worker.is_some() && !self.cancel.load(Ordering::SeqCst), egui::Button::new("Cancel reconstruction")).clicked() { self.cancel(); }
-                ui.small("Cancel force-stops this run and retains partial files.");
+                ui.small("Cancel first asks COLMAP to preserve resumable partial results, then force-stops after 10 seconds if needed.");
                 if let Some(summary) = &self.summary {
                     let workspace = summary.workspace.clone();
                     let dense = self.dense_output.clone();
@@ -964,8 +1052,30 @@ impl Studio {
                     self.load_model(path);
                 }
                 ui.add(egui::Slider::new(&mut self.point_size, 0.5..=4.0).text("Point size"));
+                if self.scene.is_some() {
+                    ui.checkbox(&mut self.show_cameras, "Cameras");
+                    if self.show_cameras {
+                        ui.add(
+                            egui::Slider::new(&mut self.camera_size, 0.01..=0.12)
+                                .text("Camera size"),
+                        );
+                    }
+                    let selected_image = self.selected_camera.and_then(|selected| {
+                        self.scene.as_ref()?.cameras.iter().find_map(|camera| {
+                            (camera.image_id == selected).then(|| camera.name.clone())
+                        })
+                    });
+                    if let Some(image_name) = selected_image
+                        && let Some(path) =
+                            source_image_path(Path::new(&self.images), &image_name)
+                        && path.is_file()
+                        && ui.button("Reveal selected image").clicked()
+                    {
+                        self.reveal_path(path);
+                    }
+                }
             });
-            ui.small("Left-drag: orbit   •   Right-drag: pan   •   Scroll: zoom");
+            ui.small("Left-drag: orbit   •   Right-drag: pan   •   Scroll: zoom   •   Double-click a camera: inspect image name");
             if let Some(path) = &self.model_path {
                 ui.label(RichText::new(path.display().to_string()).small());
             }
@@ -995,6 +1105,14 @@ impl Studio {
         let center = rect.center() + self.pan;
         let scale = rect.width().min(rect.height()) * 0.85;
         if let Some(cloud) = &self.cloud {
+            let camera_overlays = if self.show_cameras {
+                self.scene
+                    .as_ref()
+                    .and_then(|scene| scene.overlays(cloud.normalization, self.camera_size).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if self.projection_dirty {
                 self.projected_cache.clear();
                 self.projected_cache.extend(cloud.points.iter().map(|p| {
@@ -1018,13 +1136,72 @@ impl Studio {
                 }
             }
             painter.add(egui::Shape::mesh(mesh));
+            let click = response
+                .double_clicked()
+                .then(|| response.interact_pointer_pos())
+                .flatten();
+            let mut nearest = None::<(f32, u32)>;
+            for camera in &camera_overlays {
+                let projected_center =
+                    orbit::project(camera.center, self.yaw, self.pitch, self.zoom);
+                let screen_center =
+                    center + Vec2::new(projected_center[0] * scale, projected_center[1] * scale);
+                if let Some(click) = click {
+                    let distance = click.distance(screen_center);
+                    if distance <= 14.0 && nearest.is_none_or(|(best, _)| distance < best) {
+                        nearest = Some((distance, camera.image_id));
+                    }
+                }
+                let projected_corners = camera.corners.map(|corner| {
+                    let projected = orbit::project(corner, self.yaw, self.pitch, self.zoom);
+                    center + Vec2::new(projected[0] * scale, projected[1] * scale)
+                });
+                let selected = self.selected_camera == Some(camera.image_id);
+                let color = if selected {
+                    Color32::from_rgb(255, 190, 85)
+                } else {
+                    Color32::from_rgb(85, 200, 230)
+                };
+                let stroke = egui::Stroke::new(if selected { 1.8 } else { 1.0 }, color);
+                for index in 0..4 {
+                    painter.line_segment(
+                        [projected_corners[index], projected_corners[(index + 1) % 4]],
+                        stroke,
+                    );
+                    painter.line_segment([screen_center, projected_corners[index]], stroke);
+                }
+                painter.circle_filled(screen_center, if selected { 3.5 } else { 2.0 }, color);
+            }
+            if let Some((_, image_id)) = nearest {
+                self.selected_camera = Some(image_id);
+            } else if response.double_clicked() && click.is_some() {
+                self.selected_camera = None;
+            }
             painter.text(
                 rect.left_top() + Vec2::splat(14.0),
                 egui::Align2::LEFT_TOP,
-                format!("{} points   •   zoom {:.1}×", cloud.total_points, self.zoom),
+                format!(
+                    "{} points   •   {} cameras   •   zoom {:.1}×",
+                    cloud.total_points,
+                    camera_overlays.len(),
+                    self.zoom
+                ),
                 egui::FontId::monospace(12.0),
                 Color32::from_gray(180),
             );
+            if let Some(selected) = self.selected_camera
+                && let Some(camera) = camera_overlays
+                    .iter()
+                    .find(|camera| camera.image_id == selected)
+            {
+                painter.text(
+                    rect.right_top() + Vec2::new(-14.0, 14.0),
+                    egui::Align2::RIGHT_TOP,
+                    format!("Image {}\n{}", camera.image_id, camera.name),
+                    egui::FontId::monospace(12.0),
+                    Color32::from_rgb(255, 205, 120),
+                );
+            }
         } else {
             painter.text(
                 rect.center(),
@@ -1136,6 +1313,17 @@ mod tests {
         assert!(project_folder(parent, "CON").is_err());
         assert!(project_folder(parent, "scan.").is_err());
         assert!(project_folder(parent, "bad\u{1f}name").is_err());
+    }
+
+    #[test]
+    fn source_image_names_cannot_escape_photo_folder() {
+        let root = Path::new(r"C:\photos");
+        assert_eq!(
+            source_image_path(root, "day1/frame.jpg"),
+            Some(root.join("day1/frame.jpg"))
+        );
+        assert_eq!(source_image_path(root, "../secret.jpg"), None);
+        assert_eq!(source_image_path(root, r"C:\secret.jpg"), None);
     }
 
     #[test]

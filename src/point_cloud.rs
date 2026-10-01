@@ -5,12 +5,37 @@ use std::path::Path;
 pub struct Cloud {
     pub points: Vec<Point>,
     pub total_points: u64,
+    pub normalization: Normalization,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Point {
     pub xyz: [f32; 3],
     pub rgb: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Normalization {
+    factor: f64,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    extent: f64,
+}
+
+impl Normalization {
+    pub fn apply(self, xyz: [f64; 3]) -> Result<[f32; 3], String> {
+        if !xyz.iter().all(|value| value.is_finite()) {
+            return Err("Non-finite coordinate".into());
+        }
+        Ok(std::array::from_fn(|axis| {
+            if self.extent == 0. {
+                0.
+            } else {
+                (2. * ((xyz[axis] * self.factor - self.lo[axis]) / self.extent
+                    - (self.hi[axis] - self.lo[axis]) / self.extent * 0.5)) as f32
+            }
+        }))
+    }
 }
 
 pub fn load(path: &Path) -> Result<Cloud, String> {
@@ -93,24 +118,26 @@ pub(crate) fn normalized_cloud(
         hi[a] *= factor;
     }
     let extent = (0..3).map(|a| hi[a] - lo[a]).fold(0., f64::max);
+    let normalization = Normalization {
+        factor,
+        lo,
+        hi,
+        extent,
+    };
     let points = retained
         .into_iter()
-        .map(|(xyz, rgb)| Point {
-            xyz: std::array::from_fn(|a| {
-                if extent == 0. {
-                    0.
-                } else {
-                    // Divide before centering: avoids underflow for subnormal spans.
-                    (2. * ((xyz[a] * factor - lo[a]) / extent - (hi[a] - lo[a]) / extent * 0.5))
-                        as f32
-                }
-            }),
-            rgb,
+        .map(|(xyz, rgb)| {
+            Ok(Point {
+                // Divide before centering: avoids underflow for subnormal spans.
+                xyz: normalization.apply(xyz)?,
+                rgb,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(Cloud {
         points,
         total_points,
+        normalization,
     })
 }
 

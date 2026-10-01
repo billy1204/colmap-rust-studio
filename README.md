@@ -25,15 +25,15 @@ In COLMAP use File > Import model and select the printed model folder (usually `
 - Non-empty workspaces are refused. Use a new workspace for each run.
 - A per-run workspace claim prevents two launcher instances from using the same empty project folder concurrently.
 - Source photos and the COLMAP installation are not modified by the launcher.
-- `run.log` contains actual process output; percentages are not invented.
+- `run.log` contains actual process output; displayed progress comes only from COLMAP's own current/total counters.
 - Failed runs retain logs and any partial results; nothing is automatically deleted.
 - GPU errors fail visibly. There is no automatic CPU retry.
 - Some COLMAP operations use CPU even with GPU enabled.
 - Cancel before starting by answering anything other than `yes`.
-- Graceful in-progress cancellation is NOT implemented. Closing the window may leave processing running; do not treat that as a supported cancel feature.
+- The console prototype does not intercept Ctrl+C for resumable cancellation. The GUI uses COLMAP's cooperative cancellation support with a timed force-stop fallback.
 - The model gate checks non-empty output headers, not complete geometric correctness. The verification run was additionally inspected with COLMAP model_analyzer.
 - Windows console Unicode input depends on terminal configuration; the argument-based interface uses native OS strings.
-- No COLMAP binaries or sample photos are bundled here. Commercial distribution requires a separate dependency/license audit.
+- No COLMAP binaries or sample photos are bundled here. This project is BSD-3-Clause; see `THIRD_PARTY_NOTICES.md` and perform a separate dependency/license audit before redistributing COLMAP binaries.
 
 ## Command line (PowerShell)
 ```powershell

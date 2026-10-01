@@ -129,7 +129,7 @@ fn execute_with_mode(
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
     use std::sync::{atomic::Ordering, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     if cancel.load(Ordering::SeqCst) {
         return Ok(Outcome::Cancelled);
     }
@@ -148,7 +148,9 @@ fn execute_with_mode(
         writeln!(file, "\n--- NEXT PIPELINE STAGE ---").map_err(|e| e.to_string())?;
     }
     writeln!(file, "Command: {command:?}").map_err(|e| e.to_string())?;
-    command.creation_flags(0x08000000); // CREATE_NO_WINDOW: no extra terminal flashes.
+    // A dedicated hidden console lets the GUI deliver Ctrl+C to only this
+    // process tree. COLMAP 4.2+ uses it for safe, resumable shutdown.
+    command.creation_flags(0x00000010 | 0x00000200); // CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -156,6 +158,7 @@ fn execute_with_mode(
         .spawn()
         .map_err(|e| e.to_string())?;
     let mut guard = OwnedChild::attach(child)?;
+    hide_child_console(guard.child.id());
     let _ = events.try_send(format!("Started COLMAP process {}", guard.child.id()));
     writeln!(file, "PID: {}", guard.child.id()).map_err(|e| e.to_string())?;
     let stdout = guard.child.stdout.take().ok_or("Missing stdout pipe")?;
@@ -177,18 +180,37 @@ fn execute_with_mode(
         }
     });
     let mut cancelled = false;
+    let mut graceful_deadline = None;
     let mut status = None;
     let mut disconnected = false;
     let mut failure = None;
     while status.is_none() || !disconnected {
         if cancel.load(Ordering::SeqCst) && status.is_none() && !cancelled {
             cancelled = true;
-            guard.close_job();
-            if let Err(e) = guard.child.kill()
-                && guard.child.try_wait().ok().flatten().is_none()
-            {
-                failure = Some(format!("Could not stop child: {e}"));
+            match guard.request_graceful_shutdown() {
+                Ok(()) => {
+                    graceful_deadline = Some(Instant::now() + Duration::from_secs(10));
+                    let message = "Cancellation requested — waiting up to 10s for COLMAP to preserve partial results";
+                    let _ = events.try_send(message.into());
+                    let _ = writeln!(file, "{message}");
+                }
+                Err(error) => {
+                    let message = format!(
+                        "Graceful cancellation unavailable ({error}); force-stopping the owned process tree"
+                    );
+                    let _ = events.try_send(message.clone());
+                    let _ = writeln!(file, "{message}");
+                    guard.force_stop(&mut failure);
+                }
             }
+        }
+        if status.is_none() && graceful_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let message = "COLMAP did not finish its safe shutdown within 10s; force-stopping the owned process tree";
+            let _ = events.try_send(message.into());
+            let _ = writeln!(file, "{message}");
+            guard.force_stop(&mut failure);
+            graceful_deadline = None;
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(Ok(line)) => {
@@ -245,6 +267,32 @@ fn execute_with_mode(
     Ok(Outcome::Completed)
 }
 
+fn hide_child_console(process_id: u32) {
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole, GetConsoleCP, GetConsoleWindow,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+
+    // Best effort only: failure leaves COLMAP's console visible but does not
+    // compromise process ownership or reconstruction output.
+    unsafe {
+        let had_console = GetConsoleCP() != 0;
+        if had_console {
+            let _ = FreeConsole();
+        }
+        if AttachConsole(process_id) != 0 {
+            let window = GetConsoleWindow();
+            if !window.is_null() {
+                ShowWindow(window, SW_HIDE);
+            }
+            let _ = FreeConsole();
+        }
+        if had_console {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 // Job lifetime is owned by the worker; abnormal returns also stop its child.
 struct OwnedChild {
     child: std::process::Child,
@@ -290,6 +338,56 @@ impl OwnedChild {
                 windows_sys::Win32::Foundation::CloseHandle(self.job);
             }
             self.job = std::ptr::null_mut();
+        }
+    }
+
+    fn request_graceful_shutdown(&mut self) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
+        // The launcher must never attach itself while emitting Ctrl+C: Windows
+        // may terminate the sender despite its ignore handler. A short-lived,
+        // hidden helper attaches to COLMAP's private console instead.
+        let source = r#"using System;
+using System.Runtime.InteropServices;
+public static class ColmapSignal {
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint id);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint signal, uint group);
+}"#;
+        let script = format!(
+            "$ErrorActionPreference='Stop'; $source=@'\n{source}\n'@; Add-Type -TypeDefinition $source; [void][ColmapSignal]::FreeConsole(); if (-not [ColmapSignal]::AttachConsole({})) {{ exit 2 }}; [void][ColmapSignal]::SetConsoleCtrlHandler([IntPtr]::Zero,$true); if (-not [ColmapSignal]::GenerateConsoleCtrlEvent(0,0)) {{ exit 3 }}; Start-Sleep -Milliseconds 150",
+            self.child.id()
+        );
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Cannot start cancellation helper: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Cancellation helper exited with {status}"))
+        }
+    }
+
+    fn force_stop(&mut self, failure: &mut Option<String>) {
+        self.close_job();
+        if let Err(error) = self.child.kill()
+            && self.child.try_wait().ok().flatten().is_none()
+        {
+            *failure = Some(format!("Could not stop child: {error}"));
         }
     }
 }

@@ -1,4 +1,4 @@
-use colmap_launcher::{rtx_pipeline, validate_inputs};
+use colmap_launcher::{job, rtx_pipeline, validate_inputs};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
@@ -33,4 +33,35 @@ fn real_rtx_dense_pipeline() {
     assert!(log.contains("exhaustive_matcher"));
     assert!(log.contains("patch_match_stereo"));
     assert!(log.contains("stereo_fusion"));
+}
+
+#[test]
+#[ignore = "requires local COLMAP and real photos; creates and removes a cancellation workspace"]
+fn real_colmap_cooperative_cancellation() {
+    let exe = PathBuf::from(std::env::var_os("COLMAP_RTX_EXE").expect("COLMAP_RTX_EXE"));
+    let images = PathBuf::from(std::env::var_os("COLMAP_RTX_IMAGES").expect("COLMAP_RTX_IMAGES"));
+    let workspace = PathBuf::from(
+        std::env::var_os("COLMAP_CANCEL_WORKSPACE").expect("COLMAP_CANCEL_WORKSPACE"),
+    );
+    validate_inputs(&exe, &images, &workspace).unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+    let mut stage = rtx_pipeline::sparse_stages(&exe, &images, &workspace).remove(0);
+    stage.command.current_dir(&workspace);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let (tx, rx) = mpsc::sync_channel(512);
+    let log = workspace.join("run.log");
+    let worker_log = log.clone();
+    let worker = std::thread::spawn(move || {
+        job::execute(&mut stage.command, &worker_log, worker_cancel, tx)
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("COLMAP process start event");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(worker.join().unwrap().unwrap(), job::Outcome::Cancelled);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("waiting up to 10s"), "{text}");
+    assert!(!text.contains("force-stopping"), "{text}");
+    std::fs::remove_dir_all(&workspace).unwrap();
 }

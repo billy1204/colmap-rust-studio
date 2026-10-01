@@ -1,4 +1,4 @@
-use colmap_launcher::{diagnostics, ply};
+use colmap_launcher::{diagnostics, ply, point_cloud, sparse_scene};
 use std::path::PathBuf;
 
 #[test]
@@ -26,4 +26,13 @@ fn real_dense_preview_and_diagnostics() {
     );
     assert!(report.gpu.is_ok(), "GPU detection failed: {report:?}");
     assert!(report.free_bytes.expect("disk space") > 0);
+
+    let model = workspace.join("sparse").join("0");
+    let sparse = point_cloud::load(&model.join("points3D.bin")).expect("load sparse points");
+    let scene = sparse_scene::load(&model).expect("load sparse cameras, images, rigs, and frames");
+    assert!(!scene.cameras.is_empty());
+    assert_eq!(
+        scene.overlays(sparse.normalization, 0.035).unwrap().len(),
+        scene.cameras.len()
+    );
 }

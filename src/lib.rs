@@ -5,8 +5,10 @@ pub mod orbit;
 pub mod ply;
 pub mod point_cloud;
 pub mod preflight;
+pub mod progress;
 pub mod rtx_pipeline;
 pub mod settings;
+pub mod sparse_scene;
 pub mod studio_support;
 use std::path::Path;
 

@@ -9,13 +9,13 @@ The original `colmap-launcher.exe` remains available separately.
 - Native Rust/egui window with photo selection, project naming, output-parent selection, and the COLMAP path under Advanced settings.
 - Background sparse reconstruction, bounded on-screen logs and full run.log on disk.
 - Explicit `Quick Sparse Preview` and `RTX Dense Point Cloud` pipeline cards. Dense mode uses CUDA SIFT extraction/matching and CUDA PatchMatch stereo on GPU 0, then CPU mapping/fusion. Output is `dense/<model>/fused.ply`.
-- Start and Cancel controls. Cancel force-stops the owned COLMAP job; it does not save a resumable checkpoint. Partial files remain, and cannot be reused automatically.
+- Start and Cancel controls. Cancel first sends COLMAP a cooperative Ctrl+C so supported stages can preserve resumable partial results, then force-stops the owned process tree after 10 seconds if necessary. The Studio does not yet resume those partial results automatically.
 - Windows Job Object cleanup and child-process wait on cancellation / window close.
-- Native sparse `points3D.bin` and dense ASCII/binary-little-endian `fused.ply` loading; colored 3D point preview, Sparse/Dense switch, left-drag orbit, right-drag pan, scroll zoom, point-size slider, and Reset view.
+- Native sparse `points3D.bin`, `cameras.bin`, `images.bin`, `rigs.bin`, and `frames.bin` parsing plus dense ASCII/binary-little-endian `fused.ply` loading. The 3D preview includes colored points, selectable camera frustums and registered image names, Sparse/Dense switching, orbit, pan, zoom, size controls, and Reset view.
 - The preview retains up to 100,000 deterministically sampled points and rejects malformed/truncated files. Input files exceeding 10 million declared points are not supported by this preview.
-- No percentages or speedup claims. Engine remains COLMAP.
+- Progress bars are shown only when COLMAP emits an explicit current/total counter; no percentages or speedup claims are invented. Engine remains COLMAP.
 - Named real stages, dense disk-space preflight, completion metrics/actions, hidden-by-default technical logs, atomic recent-project settings, and a compatibility check for COLMAP, plugins, NVIDIA GPU/VRAM, driver, and project-volume disk space.
-- Exclusive per-run workspace claims, preserved backups for malformed settings, native Windows path arguments, and visible warnings when optional model metrics cannot be collected.
+- Exclusive per-run workspace claims, preserved backups for malformed settings, native Windows path arguments, visible warnings when optional model metrics cannot be collected, and compatibility warnings for COLMAP releases with known pipeline defects.
 
 ## Try the existing result first
 Choose Open existing point cloud and select:
@@ -28,7 +28,7 @@ The defaults point to the installed COLMAP and downloaded South Building sample.
 After any run, choose New workspace name before starting again. Never use the photo folder as workspace.
 
 ## Verification status — important
-- 50 routine automated tests passed: input validation, exclusive workspace claims, pipeline command construction, native Windows paths, stage state, logging, cancellation, defensive sparse/dense parsing, deterministic sampling, metrics, recoverable settings, diagnostics parsing, project naming, projection math, and GUI error handling.
+- 56 routine automated tests passed: input validation, exclusive workspace claims, pipeline command construction, native Windows paths, genuine progress parsing, stage state, cooperative/fallback cancellation, defensive sparse/dense and modern rig parsing, safe source-image resolution, deterministic sampling, metrics, recoverable settings, diagnostics/version warnings, project naming, projection math, and GUI error handling.
 - cargo fmt --check and cargo clippy --features gui --all-targets -- -D warnings passed.
 - Windows GitHub Actions now enforces formatting, tests, Clippy, and release builds on pushes and pull requests.
 - Release executable built and desktop copy checksum verified.
@@ -44,4 +44,4 @@ cargo build --release --features gui --bin colmap-studio
 ```
 
 ## Limitations
-This remains a point-cloud application, not a mesh/texturing tool. There are no connected surfaces, photo textures, resumable checkpoints, camera-frustum overlays, or installer. Cancellation is forceful. On-screen technical logs are bounded and may skip lines under heavy output; the complete disk log is preserved. Recent projects save only small path/pipeline metadata. The source directory and commercial licensing obligations remain documented in the original README.
+This remains a point-cloud application, not a mesh/texturing tool. There are no connected surfaces, photo textures, automatic resume workflow, source-image pixel viewer, or installer. On-screen technical logs are bounded and may skip lines under heavy output; the complete disk log is preserved. Recent projects save only small path/pipeline metadata. COLMAP is separately installed and retains its own dependency licensing obligations; see `THIRD_PARTY_NOTICES.md`.

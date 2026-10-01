@@ -13,6 +13,7 @@ pub struct GpuInfo {
 #[derive(Clone, Debug)]
 pub struct DiagnosticReport {
     pub colmap_version: Option<String>,
+    pub compatibility_warning: Option<String>,
     pub plugins_found: bool,
     pub gpu: Result<GpuInfo, String>,
     pub free_bytes: Result<u64, String>,
@@ -79,18 +80,51 @@ pub fn detect_colmap_version(text: &str) -> Option<String> {
     text[start..].split_whitespace().next().map(str::to_owned)
 }
 
+pub fn version_warning(version: &str) -> Option<String> {
+    let mut fields = version.split('.');
+    let parsed = (
+        fields.next()?.parse::<u32>().ok()?,
+        fields.next()?.parse::<u32>().ok()?,
+        fields
+            .next()?
+            .split(|character: char| !character.is_ascii_digit())
+            .next()?
+            .parse::<u32>()
+            .ok()?,
+    );
+    if parsed < (4, 2, 0) {
+        Some(format!(
+            "COLMAP {version} is older than the tested 4.2 command interface"
+        ))
+    } else if parsed < (4, 2, 1) {
+        Some(format!(
+            "COLMAP {version} has known CUDA, point-color, global-mapper, and PLY defects fixed in 4.2.1; upgrading is recommended"
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn run(install: &Path, workspace: &Path) -> DiagnosticReport {
     let exe = install.join("bin").join("colmap.exe");
-    let colmap_version = output_with_timeout(Command::new(&exe).arg("-h"), Duration::from_secs(5))
-        .ok()
-        .and_then(|output| {
-            let text = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            detect_colmap_version(&text)
-        });
+    let read_version = |output: std::process::Output| {
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        detect_colmap_version(&text)
+    };
+    let colmap_version =
+        output_with_timeout(Command::new(&exe).arg("version"), Duration::from_secs(5))
+            .ok()
+            .and_then(read_version)
+            .or_else(|| {
+                output_with_timeout(Command::new(&exe).arg("-h"), Duration::from_secs(5))
+                    .ok()
+                    .and_then(read_version)
+            });
+    let compatibility_warning = colmap_version.as_deref().and_then(version_warning);
     let mut gpu_command = Command::new("nvidia-smi.exe");
     gpu_command.args([
         "--query-gpu=name,memory.total,driver_version",
@@ -107,6 +141,7 @@ pub fn run(install: &Path, workspace: &Path) -> DiagnosticReport {
         });
     DiagnosticReport {
         colmap_version,
+        compatibility_warning,
         plugins_found: install.join("plugins").is_dir(),
         gpu,
         free_bytes: preflight::free_space(workspace),
@@ -129,5 +164,13 @@ mod tests {
             detect_colmap_version("COLMAP 4.2.0 -- Structure-from-Motion"),
             Some("4.2.0".into())
         );
+    }
+    #[test]
+    fn warns_for_known_problematic_or_unsupported_versions() {
+        assert!(version_warning("4.1.1").unwrap().contains("tested"));
+        assert!(version_warning("4.2.0").unwrap().contains("4.2.1"));
+        assert_eq!(version_warning("4.2.1"), None);
+        assert_eq!(version_warning("4.3.0.dev0"), None);
+        assert_eq!(version_warning("unknown"), None);
     }
 }
