@@ -1,5 +1,7 @@
 # COLMAP Rust Studio (Linux)
 
+> **Beta:** the Linux version is in beta. Expect rough edges, and please report problems in [Issues](https://github.com/billy1204/colmap-rust-studio/issues).
+
 A native Linux GUI (`colmap-studio`) and console launcher (`colmap-launcher`) that drive your existing [COLMAP](https://colmap.github.io/) installation. Rust handles the workflow, job control and previews; COLMAP still does the reconstruction, so no speed advantage over running the same COLMAP commands is claimed.
 
 Tested on Pop!_OS 24.04 (COSMIC, Wayland) with an NVIDIA RTX 5050 and driver 595. See [GUI_README.md](GUI_README.md) for the GUI walkthrough.
@@ -8,6 +10,9 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland) with an NVIDIA RTX 5050 and driver 595
 - Rust 1.85+ (edition 2024), with `rustfmt` and `clippy` for the checks.
 - No GTK or other `-dev` packages. Windows use winit (native Wayland, X11 fallback) with the glow (OpenGL/EGL) renderer. File pickers use the XDG desktop portal (`xdg-desktop-portal` plus your desktop's backend, which COSMIC, GNOME and KDE already ship).
 - COLMAP, installed separately (see below).
+
+## Download
+Grab `COLMAP-Rust-Studio-x86_64.AppImage` from [Releases](https://github.com/billy1204/colmap-rust-studio/releases), then `chmod +x` it and run it. COLMAP is not bundled; install it separately (see below).
 
 ## Build and run
 ```bash
