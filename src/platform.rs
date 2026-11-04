@@ -70,6 +70,40 @@ pub fn default_install() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/local"))
 }
 
+/// Search common places for COLMAP installs and return each install root
+/// (the folder containing `bin/colmap`), best match first, without duplicates.
+pub fn find_installs() -> Vec<PathBuf> {
+    let mut exes: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("COLMAP_BIN").map(PathBuf::from) {
+        exes.push(p);
+    }
+    if let Some(p) = find_on_path(COLMAP_EXE) {
+        exes.push(p);
+    }
+    let home = home_dir();
+    let roots: Vec<PathBuf> = if cfg!(windows) {
+        vec![home.join("Desktop").join("colmap"), PathBuf::from(r"C:\Program Files\COLMAP")]
+    } else {
+        vec![
+            home.join(".local"),
+            PathBuf::from("/usr/local"),
+            PathBuf::from("/usr"),
+            PathBuf::from("/opt/colmap"),
+            home.join("colmap-install"),
+            home.join("colmap"),
+        ]
+    };
+    exes.extend(roots.iter().map(|r| r.join("bin").join(COLMAP_EXE)));
+    let mut found: Vec<PathBuf> = Vec::new();
+    for exe in exes.into_iter().filter(|e| e.is_file()) {
+        let root = install_root_of(&exe).unwrap_or(exe);
+        if !found.contains(&root) {
+            found.push(root);
+        }
+    }
+    found
+}
+
 fn install_root_of(exe: &Path) -> Option<PathBuf> {
     let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let bin = exe.parent()?;

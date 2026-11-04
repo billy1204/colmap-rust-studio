@@ -42,6 +42,7 @@ struct RunSummary {
 }
 struct Studio {
     install: String,
+    colmap_search: Option<String>,
     images: String,
     workspace: String,
     output_parent: String,
@@ -87,6 +88,7 @@ impl Default for Studio {
         };
         Self {
             install: install.display().to_string(),
+            colmap_search: None,
             images: samples
                 .join("south-building")
                 .join("south-building")
@@ -719,6 +721,21 @@ impl Studio {
                         .default_open(false)
                         .show(ui, |ui| {
                             folder_field(ui, "COLMAP installation", &mut self.install);
+                            if ui.button("Find COLMAP").clicked() {
+                                let found = platform::find_installs();
+                                self.colmap_search = Some(match found.first() {
+                                    Some(first) => {
+                                        self.install = first.display().to_string();
+                                        let list: Vec<String> =
+                                            found.iter().map(|p| p.display().to_string()).collect();
+                                        format!("Found: {}", list.join(", "))
+                                    }
+                                    None => "No COLMAP found. Install it or browse to it.".into(),
+                                });
+                            }
+                            if let Some(msg) = &self.colmap_search {
+                                ui.small(msg);
+                            }
                             ui.small("Change this only when COLMAP was installed elsewhere.");
                             if ui
                                 .add_enabled(
