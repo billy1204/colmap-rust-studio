@@ -4,8 +4,6 @@ A native Linux GUI (`colmap-studio`) and console launcher (`colmap-launcher`) th
 
 Tested on Pop!_OS 24.04 (COSMIC, Wayland) with an NVIDIA RTX 5050 and driver 595. See [GUI_README.md](GUI_README.md) for the GUI walkthrough.
 
-> This repository was originally a Windows project. The Linux port replaced it; the Windows version is still in the git history (commit `e4a67b2` and earlier).
-
 ## Requirements
 - Rust 1.85+ (edition 2024), with `rustfmt` and `clippy` for the checks.
 - No GTK or other `-dev` packages. Windows use winit (native Wayland, X11 fallback) with the glow (OpenGL/EGL) renderer. File pickers use the XDG desktop portal (`xdg-desktop-portal` plus your desktop's backend, which COSMIC, GNOME and KDE already ship).
