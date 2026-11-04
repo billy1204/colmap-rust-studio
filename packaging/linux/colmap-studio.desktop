@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=COLMAP Rust Studio
+Comment=GUI for COLMAP 3D reconstruction
+Exec=colmap-studio
+Icon=colmap-studio
+Terminal=false
+Categories=Graphics;3DGraphics;
