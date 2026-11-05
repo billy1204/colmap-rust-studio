@@ -349,6 +349,8 @@ impl OwnedChild {
             return;
         }
         // SAFETY: plain syscalls on a process group this worker created.
+        // SIGCONT first: a paused (SIGSTOPped) group would ignore SIGTERM.
+        unsafe { libc::killpg(pgid, libc::SIGCONT) };
         if unsafe { libc::killpg(pgid, libc::SIGTERM) } != 0 {
             // ESRCH: the whole group has already exited.
             let _ = self.child.try_wait();

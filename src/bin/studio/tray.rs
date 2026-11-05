@@ -395,22 +395,100 @@ impl Job {
     fn running(&self) -> bool {
         self.result.is_none()
     }
-    fn signal(&self, sig: i32) {
-        if let Some(pgid) = self.pgid {
-            // SAFETY: signals the COLMAP process group this job created.
-            unsafe { libc::killpg(pgid, sig) };
-        }
-    }
-    fn set_paused(&mut self, paused: bool) {
-        self.signal(if paused { libc::SIGSTOP } else { libc::SIGCONT });
-        self.paused = paused;
-    }
-    fn cancel(&mut self) {
+    /// Mark the job cancelled. Returns the process group to resume with
+    /// SIGCONT (a stopped COLMAP can't see SIGTERM); send it with
+    /// `resume_group` after releasing the state lock.
+    fn cancel(&mut self) -> Option<i32> {
         self.cancel.store(true, Ordering::SeqCst);
-        if self.paused {
-            self.set_paused(false);
+        let paused = std::mem::take(&mut self.paused);
+        self.pgid.filter(|_| paused)
+    }
+}
+
+fn resume_group(pgid: Option<i32>) {
+    if let Some(pgid) = pgid {
+        // SAFETY: signals a COLMAP process group the tray's job created.
+        unsafe { libc::killpg(pgid, libc::SIGCONT) };
+    }
+}
+
+/// Stop a COLMAP process group for good: SIGCONT (in case it is paused),
+/// SIGTERM, a short grace period, then SIGKILL.
+fn stop_group(pgid: i32) {
+    // SAFETY: plain signals to a process group this tray created.
+    unsafe {
+        libc::killpg(pgid, libc::SIGCONT);
+        if libc::killpg(pgid, libc::SIGTERM) != 0 {
+            return;
         }
     }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        // SAFETY: signal 0 only checks that the group still exists.
+        if unsafe { libc::killpg(pgid, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // SAFETY: as above.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+}
+
+/// Exit the tray without leaving COLMAP orphaned or frozen: cancel the job,
+/// stop its process group, close the socket and exit.
+fn shutdown(state: &State, code: i32) -> ! {
+    // try_lock: never hang on exit if another thread wedged with the lock.
+    let pgid = match state.try_lock() {
+        Ok(mut shared) => shared.job.as_mut().filter(|j| j.running()).and_then(|j| {
+            j.cancel();
+            j.pgid
+        }),
+        Err(_) => Some(LAST_PGID.load(Ordering::SeqCst)).filter(|p| *p > 0),
+    };
+    if let Some(pgid) = pgid {
+        stop_group(pgid);
+    }
+    let _ = std::fs::remove_file(tray_sock());
+    std::process::exit(code);
+}
+
+/// Latest COLMAP process group (0 = none), readable without the state lock.
+static LAST_PGID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_exit_signal(_: libc::c_int) {
+    let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: write is async-signal-safe; the byte is just a wake-up.
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+    }
+}
+
+/// SIGTERM/SIGHUP/SIGINT (logout, `kill`, Ctrl-C) stop the job's COLMAP
+/// processes before the tray exits. A self-pipe keeps the handler trivial.
+fn handle_exit_signals(state: State) {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills two descriptors we then own.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return;
+    }
+    SIGNAL_PIPE.store(fds[1], Ordering::SeqCst);
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: installs a handler that only calls write(2).
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_exit_signal as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        // SAFETY: reads from the pipe's read end, owned by this thread.
+        while unsafe { libc::read(fds[0], byte.as_mut_ptr().cast(), 1) } < 0 {}
+        shutdown(&state, 0);
+    });
 }
 
 #[derive(Default)]
@@ -635,6 +713,7 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
     let logs_state = state.clone();
     let logs = std::thread::spawn(move || {
         for line in rx {
+            let mut stop = None;
             let mut shared = logs_state.lock().unwrap();
             let Some(job) = shared.job.as_mut().filter(|j| j.id == id) else { continue };
             if let Some(pid) = line
@@ -643,8 +722,9 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
             {
                 // job::execute makes each COLMAP process a group leader.
                 job.pgid = Some(pid);
+                LAST_PGID.store(pid, Ordering::SeqCst);
                 if job.paused {
-                    job.signal(libc::SIGSTOP);
+                    stop = Some(pid);
                 }
             }
             if job.logs.len() >= MAX_LOG_LINES {
@@ -652,6 +732,11 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
                 job.log_base += 1;
             }
             job.logs.push_back(line);
+            drop(shared);
+            if let Some(pgid) = stop {
+                // SAFETY: pauses the COLMAP group this job just started.
+                unsafe { libc::killpg(pgid, libc::SIGSTOP) };
+            }
         }
     });
     let stage_state = state.clone();
@@ -689,6 +774,7 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
                 .map(|j| j.workspace.clone());
             if let Some(job) = shared.job.as_mut().filter(|j| j.id == id) {
                 job.pgid = None;
+                LAST_PGID.store(0, Ordering::SeqCst);
                 job.paused = false;
                 job.result = Some(result);
             }
@@ -746,9 +832,14 @@ fn handle(state: &State, req: Request) -> Response {
             })
         }
         Request::Cancel { job } => {
-            if let Some(j) = state.lock().unwrap().job.as_mut().filter(|j| j.id == job) {
-                j.cancel();
-            }
+            let resume = state
+                .lock()
+                .unwrap()
+                .job
+                .as_mut()
+                .filter(|j| j.id == job)
+                .and_then(Job::cancel);
+            resume_group(resume);
             refresh();
             Response::Ok
         }
@@ -884,10 +975,14 @@ impl ksni::Tray for StudioTray {
                     checked: paused,
                     enabled: can_pause,
                     activate: Box::new(|t: &mut Self| {
-                        if let Some(j) = t.state.lock().unwrap().job.as_mut().filter(|j| j.running())
-                        {
-                            let p = !j.paused;
-                            j.set_paused(p);
+                        let toggled = t.state.lock().unwrap().job.as_mut().filter(|j| j.running()).map(|j| {
+                            j.paused = !j.paused;
+                            (j.pgid, j.paused)
+                        });
+                        if let Some((Some(pgid), paused)) = toggled {
+                            let sig = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+                            // SAFETY: signals the job's COLMAP process group.
+                            unsafe { libc::killpg(pgid, sig) };
                         }
                         refresh();
                     }),
@@ -905,9 +1000,8 @@ impl ksni::Tray for StudioTray {
                             if confirm(
                                 "Cancel the running reconstruction?\nPartial files will be kept.",
                             ) {
-                                if let Some(j) = state.lock().unwrap().job.as_mut() {
-                                    j.cancel();
-                                }
+                                let resume = state.lock().unwrap().job.as_mut().and_then(Job::cancel);
+                                resume_group(resume);
                                 refresh();
                             }
                         });
@@ -1001,18 +1095,17 @@ fn quit(state: State) {
         if !confirm("A reconstruction is running.\nQuit the tray and cancel it?") {
             return;
         }
-        if let Some(j) = state.lock().unwrap().job.as_mut() {
-            j.cancel();
-        }
+        let resume = state.lock().unwrap().job.as_mut().and_then(Job::cancel);
+        resume_group(resume);
         let deadline = Instant::now() + Duration::from_secs(30);
         while state.lock().unwrap().job.as_ref().is_some_and(Job::running) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    let _ = std::fs::remove_file(tray_sock());
     // Quit from the tray closes the Studio window too.
     send_gui("quit");
-    std::process::exit(0);
+    // Whatever is still running after the wait is stopped, not orphaned.
+    shutdown(&state, 0);
 }
 
 /// `colmap-studio --tray`. Exit code 2 = no StatusNotifierItem host,
@@ -1042,6 +1135,7 @@ pub fn run() -> i32 {
         output_parent: prefs.output_parent,
         ..Default::default()
     }));
+    handle_exit_signals(state.clone());
     use ksni::blocking::TrayMethods;
     match (StudioTray {
         state: state.clone(),
