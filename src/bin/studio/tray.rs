@@ -5,7 +5,7 @@
 //! $XDG_RUNTIME_DIR:
 //! - `colmap-studio-tray.lock` + `.sock`: single tray process; one JSON
 //!   request line per connection, one JSON response line back.
-//! - `colmap-studio-gui.lock` + `.sock`: single window; accepts `show`.
+//! - `colmap-studio-gui.lock` + `.sock`: single window; accepts `show` and `quit`.
 
 use super::{JobResult, run_job};
 use colmap_launcher::{
@@ -295,6 +295,9 @@ pub fn listen_gui(listener: UnixListener, ctx: egui::Context) {
             if cmd.trim() == "show" {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            } else if cmd.trim() == "quit" {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 ctx.request_repaint();
             }
         }
@@ -809,6 +812,8 @@ fn quit(state: State) {
         }
     }
     let _ = std::fs::remove_file(tray_sock());
+    // Quit from the tray closes the Studio window too.
+    send_gui("quit");
     std::process::exit(0);
 }
 
