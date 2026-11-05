@@ -24,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -568,16 +568,52 @@ struct Prefs {
     notify: bool,
     #[serde(default)]
     output_parent: Option<PathBuf>,
+    /// Workspace of the last finished job, so Open output folder still
+    /// works after the tray restarts.
+    #[serde(default)]
+    last_workspace: Option<PathBuf>,
+}
+
+fn prefs_of(shared: &Shared) -> Prefs {
+    Prefs {
+        notify: shared.notify,
+        output_parent: shared.output_parent.clone(),
+        last_workspace: shared.last_workspace.clone(),
+    }
 }
 
 fn save_prefs(prefs: &Prefs) {
     let path = prefs_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let result = serde_json::to_string_pretty(prefs)
+        .map_err(std::io::Error::other)
+        .and_then(|text| {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, text)
+        });
+    if let Err(e) = result {
+        let msg = format!("Couldn't save tray settings to {}: {e}", path.display());
+        eprintln!("colmap-studio: {msg}");
+        notify_done("COLMAP Studio", &msg);
     }
-    if let Ok(text) = serde_json::to_string_pretty(prefs) {
-        let _ = std::fs::write(path, text);
-    }
+}
+
+/// Bumped on every debounced save request; only the newest one writes.
+static SAVE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Save prefs once the window stops sending path changes for a moment,
+/// so typing a project name doesn't write the file on every keystroke.
+fn schedule_save(state: &State) {
+    let generation = SAVE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let state = state.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        if SAVE_GEN.load(Ordering::SeqCst) == generation {
+            let prefs = prefs_of(&state.lock().unwrap());
+            save_prefs(&prefs);
+        }
+    });
 }
 
 fn autostart_path() -> PathBuf {
@@ -669,21 +705,36 @@ fn confirm(question: &str) -> Option<bool> {
 
 fn open_studio() {
     if !send_gui("show") {
-        let _ = spawn_detached(&[]).map(|mut child| {
+        match spawn_detached(&[]) {
             // Reap it in the background so it never lingers as a zombie.
-            std::thread::spawn(move || child.wait());
-        });
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+            }
+            Err(e) => {
+                let msg = format!("Couldn't open Studio: {e}");
+                eprintln!("colmap-studio: {msg}");
+                notify_done("COLMAP Studio", &msg);
+            }
+        }
     }
 }
 
 fn notify_done(summary: &str, body: &str) {
-    let _ = Command::new("notify-send")
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let spawned = Command::new("notify-send")
         .args(["-a", "COLMAP Studio", "-i", "colmap-studio", summary, body])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(|mut c| std::thread::spawn(move || c.wait()));
+    if let Err(e) = spawned {
+        // No notification daemon helper; log once so failures aren't silent.
+        if !WARNED.swap(true, Ordering::SeqCst) {
+            eprintln!("colmap-studio: can't show notifications (notify-send: {e})");
+        }
+        eprintln!("colmap-studio: {summary} {body}");
+    }
 }
 
 fn short(text: &str, max: usize) -> String {
@@ -826,6 +877,8 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
             }
             if let Some(workspace) = workspace {
                 shared.last_workspace = Some(workspace);
+                let prefs = prefs_of(&shared);
+                std::thread::spawn(move || save_prefs(&prefs));
             }
             shared.notify
         };
@@ -893,11 +946,8 @@ fn handle(state: &State, req: Request) -> Response {
             let mut shared = state.lock().unwrap();
             shared.output_parent = Some(parent);
             shared.pending_project = pending;
-            save_prefs(&Prefs {
-                notify: shared.notify,
-                output_parent: shared.output_parent.clone(),
-            });
             drop(shared);
+            schedule_save(state);
             refresh();
             Response::Ok
         }
@@ -1014,12 +1064,12 @@ impl ksni::Tray for StudioTray {
             }
             .into(),
         ];
-        if running {
+        // Hidden rather than disabled: COSMIC draws disabled items as clickable.
+        if can_pause {
             items.push(
                 CheckmarkItem {
                     label: "Pause".into(),
                     checked: paused,
-                    enabled: can_pause,
                     activate: Box::new(|t: &mut Self| {
                         let toggled = t.state.lock().unwrap().job.as_mut().filter(|j| j.running()).map(|j| {
                             j.paused = !j.paused;
@@ -1036,6 +1086,8 @@ impl ksni::Tray for StudioTray {
                 }
                 .into(),
             );
+        }
+        if running {
             items.push(
                 StandardItem {
                     label: "Cancel job…".into(),
@@ -1082,10 +1134,9 @@ impl ksni::Tray for StudioTray {
                 activate: Box::new(|t: &mut Self| {
                     let mut shared = t.state.lock().unwrap();
                     shared.notify = !shared.notify;
-                    save_prefs(&Prefs {
-                        notify: shared.notify,
-                        output_parent: shared.output_parent.clone(),
-                    });
+                    let prefs = prefs_of(&shared);
+                    drop(shared);
+                    save_prefs(&prefs);
                 }),
                 ..Default::default()
             }
@@ -1095,7 +1146,9 @@ impl ksni::Tray for StudioTray {
                 checked: autostart_enabled(),
                 activate: Box::new(|_: &mut Self| {
                     if let Err(e) = set_autostart(!autostart_enabled()) {
-                        eprintln!("colmap-studio: start at login: {e}");
+                        let msg = format!("Couldn't change Start at login: {e}");
+                        eprintln!("colmap-studio: {msg}");
+                        notify_done("COLMAP Studio", &msg);
                     }
                 }),
                 ..Default::default()
@@ -1197,6 +1250,7 @@ pub fn run() -> i32 {
     let state: State = Arc::new(Mutex::new(Shared {
         notify: prefs.notify,
         output_parent: prefs.output_parent,
+        last_workspace: prefs.last_workspace,
         ..Default::default()
     }));
     handle_exit_signals(state.clone());
