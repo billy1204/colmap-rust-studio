@@ -30,10 +30,21 @@ use std::time::{Duration, Instant};
 
 const MAX_LOG_LINES: usize = 5000;
 
+/// Exit code of a `--tray` launch that found another tray already running.
+pub const EXIT_ALREADY_RUNNING: i32 = 3;
+
+/// $XDG_RUNTIME_DIR, else a private per-user folder in /tmp (so two users
+/// never share lock or socket files).
 fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("colmap-studio-{uid}"));
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    dir
 }
 fn tray_lock() -> PathBuf {
     runtime_dir().join("colmap-studio-tray.lock")
@@ -50,9 +61,54 @@ fn gui_sock() -> PathBuf {
 
 /// Exclusive non-blocking flock; Some(file) while we hold it.
 fn try_lock(p: &Path) -> Option<File> {
-    let f = File::create(p).ok()?;
+    // No truncation: the file is only a lock handle.
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(p)
+        .ok()?;
     // SAFETY: plain flock on a descriptor we own.
     (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(f)
+}
+
+/// Whether a tray process is alive, judged by its socket accepting
+/// connections (not by the socket file existing, which may be stale).
+fn tray_reachable() -> bool {
+    UnixStream::connect(tray_sock()).is_ok()
+}
+
+/// Wait for a just-spawned `--tray` (or an already-running one it found) to
+/// accept connections. Exit code 3 means another tray holds the lock and is
+/// still starting, so keep waiting for its socket until the deadline.
+fn wait_for_tray(mut child: std::process::Child, deadline: Instant) -> Result<(), String> {
+    let mut exited = None;
+    loop {
+        if tray_reachable() {
+            reap(child);
+            return Ok(());
+        }
+        if exited.is_none() {
+            if let Ok(Some(status)) = child.try_wait() {
+                match status.code() {
+                    Some(EXIT_ALREADY_RUNNING) => exited = Some(status),
+                    Some(2) => return Err("no system tray host".into()),
+                    _ => return Err(format!("tray process exited ({status})")),
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            reap(child);
+            return Err("tray process did not start".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// The program to re-launch: the AppImage itself when packaged (its mount
@@ -154,12 +210,8 @@ fn request(req: &Request) -> Result<Response, String> {
 /// the tray icon is there whenever Studio is open. Failures are ignored; a
 /// job hand-off will retry and report a missing tray host.
 pub fn ensure_started() {
-    if UnixStream::connect(tray_sock()).is_err() {
-        let _ = spawn_detached(&["--tray"]).map(|mut child| {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        });
+    if !tray_reachable() {
+        let _ = spawn_detached(&["--tray"]).map(reap);
     }
 }
 
@@ -171,24 +223,9 @@ pub fn hand_off(
     images: &Path,
     workspace: &Path,
 ) -> Result<u64, String> {
-    if UnixStream::connect(tray_sock()).is_err() {
-        let mut child = spawn_detached(&["--tray"]).map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if UnixStream::connect(tray_sock()).is_ok() {
-                break;
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(match status.code() {
-                    Some(2) => "no system tray host".into(),
-                    _ => format!("tray process exited ({status})"),
-                });
-            }
-            if Instant::now() > deadline {
-                return Err("tray process did not start".into());
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    if !tray_reachable() {
+        let child = spawn_detached(&["--tray"]).map_err(|e| e.to_string())?;
+        wait_for_tray(child, Instant::now() + Duration::from_secs(5))?;
     }
     // The tray may run with a different working directory and PATH (e.g. from
     // autostart), so it always gets an absolute COLMAP path.
@@ -232,7 +269,7 @@ pub fn sync_output(parent: &Path, pending: Option<&Path>) {
     if last.as_ref() == Some(&key) {
         return;
     }
-    if !tray_sock().exists() {
+    if !tray_reachable() {
         return;
     }
     let req = Request::SetOutput {
@@ -978,11 +1015,22 @@ fn quit(state: State) {
     std::process::exit(0);
 }
 
-/// `colmap-studio --tray`. Exit code 2 = no StatusNotifierItem host.
+/// `colmap-studio --tray`. Exit code 2 = no StatusNotifierItem host,
+/// 3 = another tray is already running.
 pub fn run() -> i32 {
-    let Some(_lock) = try_lock(&tray_lock()) else {
+    // A client probing the lock never takes it, but retry briefly anyway so
+    // a racing launch doesn't misreport "already running".
+    let mut lock = None;
+    for _ in 0..5 {
+        lock = try_lock(&tray_lock());
+        if lock.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let Some(_lock) = lock else {
         eprintln!("colmap-studio: tray already running");
-        return 0;
+        return EXIT_ALREADY_RUNNING;
     };
     refresh_autostart();
     let prefs: Prefs = std::fs::read_to_string(prefs_path())
@@ -1012,7 +1060,8 @@ pub fn run() -> i32 {
         }
     }
     // Bind only once the icon is registered, so a window never hands a job
-    // to a tray process that is about to exit.
+    // to a tray process that is about to exit. We hold the lock, so any
+    // existing socket file is stale (left by a crashed tray): remove it.
     let _ = std::fs::remove_file(tray_sock());
     let listener = match UnixListener::bind(tray_sock()) {
         Ok(l) => l,
