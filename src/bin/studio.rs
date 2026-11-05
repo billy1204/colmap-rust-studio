@@ -1101,6 +1101,12 @@ impl Studio {
 impl eframe::App for Studio {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        #[cfg(target_os = "linux")]
+        if self.use_tray {
+            let parent = PathBuf::from(&self.output_parent);
+            let pending = project_folder(Path::new(&self.output_parent), &self.project_name).ok();
+            tray::sync_output(&parent, pending.as_deref());
+        }
         if self.worker.is_some() || self.loader.is_some() || self.diagnostics_worker.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -1197,6 +1203,10 @@ fn main() -> eframe::Result {
                     std::mem::forget(lock);
                 }
                 app.attach_running();
+                let parent = PathBuf::from(&app.output_parent);
+                let pending =
+                    project_folder(Path::new(&app.output_parent), &app.project_name).ok();
+                tray::sync_output(&parent, pending.as_deref());
             }
             if let Some(path) = model {
                 app.load_model(path);

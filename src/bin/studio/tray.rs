@@ -102,6 +102,12 @@ enum Request {
     Cancel {
         job: u64,
     },
+    /// Window → tray: Output parent folder and pending project folder
+    /// (`parent` / project name). `pending` is None when the name is invalid.
+    SetOutput {
+        parent: PathBuf,
+        pending: Option<PathBuf>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -207,6 +213,28 @@ pub fn running_job() -> Option<Snapshot> {
     match request(&req).ok()? {
         Response::Status(s) if s.result.is_none() => Some(s),
         _ => None,
+    }
+}
+
+/// Tell the tray the window's Output parent and pending project folder.
+/// Sends only when the paths change from the last successful sync. If the
+/// tray isn't running, fails silently and retries on a later call.
+pub fn sync_output(parent: &Path, pending: Option<&Path>) {
+    static LAST: Mutex<Option<(PathBuf, Option<PathBuf>)>> = Mutex::new(None);
+    let key = (parent.to_owned(), pending.map(Path::to_owned));
+    let mut last = LAST.lock().unwrap();
+    if last.as_ref() == Some(&key) {
+        return;
+    }
+    if !tray_sock().exists() {
+        return;
+    }
+    let req = Request::SetOutput {
+        parent: key.0.clone(),
+        pending: key.1.clone(),
+    };
+    if request(&req).is_ok() {
+        *last = Some(key);
     }
 }
 
@@ -347,6 +375,12 @@ struct Shared {
     job: Option<Job>,
     next_id: u64,
     notify: bool,
+    /// Window's Output parent folder (also persisted in tray.json).
+    output_parent: Option<PathBuf>,
+    /// Pending project folder: Output parent + project name (from the window).
+    pending_project: Option<PathBuf>,
+    /// Workspace of the last finished job (survives after the run ends).
+    last_workspace: Option<PathBuf>,
 }
 
 type State = Arc<Mutex<Shared>>;
@@ -367,6 +401,8 @@ fn prefs_path() -> PathBuf {
 #[derive(Serialize, Deserialize, Default)]
 struct Prefs {
     notify: bool,
+    #[serde(default)]
+    output_parent: Option<PathBuf>,
 }
 
 fn save_prefs(prefs: &Prefs) {
@@ -451,6 +487,43 @@ fn short(text: &str, max: usize) -> String {
     }
 }
 
+fn short_path(path: &Path, max: usize) -> String {
+    let text = path.display().to_string();
+    if text.chars().count() <= max {
+        return text;
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = text.chars().rev().take(keep).collect::<String>().chars().rev().collect();
+    format!("…{tail}")
+}
+
+/// Open-folder target, in priority order:
+/// running job workspace → pending project → output parent → last finished workspace.
+fn open_target(shared: &Shared) -> Option<PathBuf> {
+    let running = shared
+        .job
+        .as_ref()
+        .filter(|j| j.running())
+        .map(|j| &j.workspace);
+    let finished = shared
+        .last_workspace
+        .as_ref()
+        .or_else(|| shared.job.as_ref().map(|j| &j.workspace));
+    [running, shared.pending_project.as_ref(), shared.output_parent.as_ref(), finished]
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_dir())
+        .cloned()
+}
+
+fn open_folder(path: &Path) {
+    if let Err(e) = colmap_launcher::platform::open_in_shell(path) {
+        let msg = format!("Couldn't open {}: {e}", path.display());
+        eprintln!("colmap-studio: {msg}");
+        notify_done(&msg, "");
+    }
+}
+
 fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBuf, workspace: PathBuf) -> Response {
     let mut shared = state.lock().unwrap();
     if shared.job.as_ref().is_some_and(Job::running) {
@@ -525,10 +598,18 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
         };
         let notify = {
             let mut shared = worker_state.lock().unwrap();
+            let workspace = shared
+                .job
+                .as_ref()
+                .filter(|j| j.id == id)
+                .map(|j| j.workspace.clone());
             if let Some(job) = shared.job.as_mut().filter(|j| j.id == id) {
                 job.pgid = None;
                 job.paused = false;
                 job.result = Some(result);
+            }
+            if let Some(workspace) = workspace {
+                shared.last_workspace = Some(workspace);
             }
             shared.notify
         };
@@ -580,6 +661,18 @@ fn handle(state: &State, req: Request) -> Response {
             if let Some(j) = state.lock().unwrap().job.as_mut().filter(|j| j.id == job) {
                 j.cancel();
             }
+            refresh();
+            Response::Ok
+        }
+        Request::SetOutput { parent, pending } => {
+            let mut shared = state.lock().unwrap();
+            shared.output_parent = Some(parent);
+            shared.pending_project = pending;
+            save_prefs(&Prefs {
+                notify: shared.notify,
+                output_parent: shared.output_parent.clone(),
+            });
+            drop(shared);
             refresh();
             Response::Ok
         }
@@ -673,7 +766,7 @@ impl ksni::Tray for StudioTray {
         open_studio();
     }
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let (status, running, paused, can_pause, workspace, notify) = {
+        let (status, running, paused, can_pause, target, notify) = {
             let shared = self.state.lock().unwrap();
             let job = shared.job.as_ref();
             (
@@ -681,11 +774,11 @@ impl ksni::Tray for StudioTray {
                 job.is_some_and(Job::running),
                 job.is_some_and(|j| j.paused),
                 job.is_some_and(|j| j.running() && j.pgid.is_some()),
-                job.map(|j| j.workspace.clone()),
+                open_target(&shared),
                 shared.notify,
             )
         };
-        vec![
+        let mut items: Vec<MenuItem<Self>> = vec![
             label(status),
             MenuItem::Separator,
             StandardItem {
@@ -695,49 +788,64 @@ impl ksni::Tray for StudioTray {
                 ..Default::default()
             }
             .into(),
-            CheckmarkItem {
-                label: "Pause".into(),
-                checked: paused,
-                enabled: can_pause,
-                activate: Box::new(|t: &mut Self| {
-                    if let Some(j) = t.state.lock().unwrap().job.as_mut().filter(|j| j.running()) {
-                        let p = !j.paused;
-                        j.set_paused(p);
-                    }
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Cancel job…".into(),
-                icon_name: "process-stop".into(),
-                enabled: running,
-                activate: Box::new(|t: &mut Self| {
-                    let state = t.state.clone();
-                    std::thread::spawn(move || {
-                        if confirm("Cancel the running reconstruction?\nPartial files will be kept.") {
-                            if let Some(j) = state.lock().unwrap().job.as_mut() {
-                                j.cancel();
-                            }
-                            refresh();
+        ];
+        if running {
+            items.push(
+                CheckmarkItem {
+                    label: "Pause".into(),
+                    checked: paused,
+                    enabled: can_pause,
+                    activate: Box::new(|t: &mut Self| {
+                        if let Some(j) = t.state.lock().unwrap().job.as_mut().filter(|j| j.running())
+                        {
+                            let p = !j.paused;
+                            j.set_paused(p);
                         }
-                    });
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Open output folder".into(),
-                icon_name: "folder-open".into(),
-                enabled: workspace.as_ref().is_some_and(|w| w.is_dir()),
-                activate: Box::new(move |_| {
-                    if let Some(w) = &workspace {
-                        let _ = colmap_launcher::platform::open_in_shell(w);
-                    }
-                }),
-                ..Default::default()
-            }
-            .into(),
+                        refresh();
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: "Cancel job…".into(),
+                    icon_name: "process-stop".into(),
+                    activate: Box::new(|t: &mut Self| {
+                        let state = t.state.clone();
+                        std::thread::spawn(move || {
+                            if confirm(
+                                "Cancel the running reconstruction?\nPartial files will be kept.",
+                            ) {
+                                if let Some(j) = state.lock().unwrap().job.as_mut() {
+                                    j.cancel();
+                                }
+                                refresh();
+                            }
+                        });
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if let Some(target) = target {
+            items.push(label(format!("Output: {}", short_path(&target, 48))));
+            items.push(
+                StandardItem {
+                    label: "Open output folder".into(),
+                    icon_name: "folder-open".into(),
+                    activate: Box::new(|t: &mut Self| {
+                        if let Some(path) = open_target(&t.state.lock().unwrap()) {
+                            open_folder(&path);
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.extend([
             MenuItem::Separator,
             CheckmarkItem {
                 label: "Notify when done".into(),
@@ -747,6 +855,7 @@ impl ksni::Tray for StudioTray {
                     shared.notify = !shared.notify;
                     save_prefs(&Prefs {
                         notify: shared.notify,
+                        output_parent: shared.output_parent.clone(),
                     });
                 }),
                 ..Default::default()
@@ -774,7 +883,8 @@ impl ksni::Tray for StudioTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
         eprintln!("colmap-studio: tray host went away ({reason:?}); jobs keep running");
@@ -829,6 +939,7 @@ pub fn run() -> i32 {
         .unwrap_or_default();
     let state: State = Arc::new(Mutex::new(Shared {
         notify: prefs.notify,
+        output_parent: prefs.output_parent,
         ..Default::default()
     }));
     use ksni::blocking::TrayMethods;
