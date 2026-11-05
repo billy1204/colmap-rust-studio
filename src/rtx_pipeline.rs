@@ -273,6 +273,16 @@ pub fn run_with_events(
     }
 
     let models = sparse_models(workspace)?;
+    // PatchMatch stereo needs CUDA. Stop with the sparse result instead of
+    // starting a dense stage that is certain to fail.
+    if crate::diagnostics::colmap_cuda(colmap) == Some(false) {
+        return Err(format!(
+            "COLMAP at {} was built without CUDA, so dense reconstruction can't run. \
+             The sparse model was kept in {}; install a CUDA build of COLMAP or use Quick sparse.",
+            colmap.display(),
+            workspace.join("sparse").display()
+        ));
+    }
     std::fs::create_dir(workspace.join("dense")).map_err(|e| e.to_string())?;
     for model in &models {
         let id = model.file_name().ok_or("Sparse model has no folder name")?;

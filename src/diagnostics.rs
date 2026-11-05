@@ -30,16 +30,30 @@ fn output_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    use std::io::Read;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
+    // Drain both pipes concurrently so a chatty child never blocks on a full
+    // pipe while we wait for it to exit.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
-            Some(_) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Some(status) => break status,
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
             None => {
                 let _ = child.kill();
@@ -47,7 +61,12 @@ fn output_with_timeout(
                 return Err("diagnostic command timed out".into());
             }
         }
-    }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 pub fn parse_gpu(text: &str) -> Result<GpuInfo, String> {
@@ -82,15 +101,30 @@ pub fn detect_colmap_version(text: &str) -> Option<String> {
     text[start..].split_whitespace().next().map(str::to_owned)
 }
 
-/// COLMAP's help banner ends with "with CUDA" or "without CUDA".
+/// COLMAP's help banner (the first line starting with "COLMAP") ends with
+/// "with CUDA)" or "without CUDA)". Other help text is ignored.
 pub fn detect_cuda(text: &str) -> Option<bool> {
-    if text.contains("without CUDA") {
+    let banner = text.lines().map(str::trim).find(|l| l.starts_with("COLMAP "))?;
+    if banner.contains("without CUDA") {
         Some(false)
-    } else if text.contains("with CUDA") {
+    } else if banner.contains("with CUDA") {
         Some(true)
     } else {
         None
     }
+}
+
+/// Ask a COLMAP executable whether it was built with CUDA (`colmap -h`).
+pub fn colmap_cuda(exe: &Path) -> Option<bool> {
+    let mut command = Command::new(exe);
+    command.arg("-h");
+    crate::platform::configure_colmap_env(&mut command, exe);
+    let output = output_with_timeout(&mut command, Duration::from_secs(10)).ok()?;
+    detect_cuda(&format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 pub fn run(install: &Path, workspace: &Path) -> DiagnosticReport {
@@ -150,6 +184,25 @@ mod tests {
         );
         assert_eq!(detect_cuda("COLMAP 3.9.1 (without CUDA)"), Some(false));
         assert_eq!(detect_cuda("usage"), None);
+        assert_eq!(
+            detect_cuda("COLMAP 4.3.0.dev0 (Commit 30a1a81 on 2026-11-04 with CUDA)\nUsage:"),
+            Some(true)
+        );
+        // Only the banner counts, not option help mentioning CUDA.
+        assert_eq!(
+            detect_cuda("COLMAP 3.9 (Commit x without CUDA)\n  --use_gpu  run with CUDA"),
+            Some(false)
+        );
+        assert_eq!(detect_cuda("Usage: run with CUDA"), None);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn output_with_timeout_drains_large_output() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "head -c 1000000 /dev/zero; head -c 1000000 /dev/zero 1>&2"]);
+        let out = output_with_timeout(&mut c, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.stdout.len(), 1_000_000);
+        assert_eq!(out.stderr.len(), 1_000_000);
     }
     #[test]
     fn finds_colmap_version() {
