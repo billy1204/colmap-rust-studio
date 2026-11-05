@@ -9,5 +9,9 @@ APPDIR=target/AppDir
 rm -rf "$APPDIR" && mkdir -p "$APPDIR/usr/bin"
 install -m755 target/release/colmap-studio target/release/colmap-launcher "$APPDIR/usr/bin/"
 install -m755 packaging/linux/AppRun "$APPDIR/AppRun"
-cp packaging/linux/colmap-studio.desktop packaging/linux/colmap-studio.png "$APPDIR/"
+cp packaging/linux/colmap-studio.desktop packaging/linux/colmap-studio.svg packaging/linux/colmap-studio.png "$APPDIR/"
+ln -s colmap-studio.png "$APPDIR/.DirIcon"
+install -Dm644 packaging/linux/colmap-studio.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/colmap-studio.svg"
+install -Dm644 packaging/linux/colmap-studio.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/colmap-studio.png"
+install -Dm644 packaging/linux/colmap-studio.desktop "$APPDIR/usr/share/applications/colmap-studio.desktop"
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$TOOL" --no-appstream "$APPDIR" COLMAP-Rust-Studio-x86_64.AppImage
