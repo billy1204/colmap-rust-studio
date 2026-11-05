@@ -186,10 +186,16 @@ pub struct Snapshot {
     result: Option<Result<JobResult, String>>,
 }
 
+/// Request from a background thread; may wait for a busy tray.
 fn request(req: &Request) -> Result<Response, String> {
+    request_with(req, Duration::from_secs(10))
+}
+
+fn request_with(req: &Request, timeout: Duration) -> Result<Response, String> {
     let mut stream = UnixStream::connect(tray_sock()).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(timeout))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
         .map_err(|e| e.to_string())?;
     let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
     line.push('\n');
@@ -253,32 +259,66 @@ pub fn running_job() -> Option<Snapshot> {
         log_from: usize::MAX,
         stage_from: usize::MAX,
     };
-    match request(&req).ok()? {
+    // Called on the UI thread at startup: short timeouts, one retry.
+    let reply = request_with(&req, Duration::from_millis(200))
+        .or_else(|_| request_with(&req, Duration::from_millis(200)))
+        .ok()?;
+    match reply {
         Response::Status(s) if s.result.is_none() => Some(s),
         _ => None,
     }
 }
 
 /// Tell the tray the window's Output parent and pending project folder.
-/// Sends only when the paths change from the last successful sync. If the
-/// tray isn't running, fails silently and retries on a later call.
+/// Called every frame from the UI thread, so it never blocks: changes are
+/// handed to a background thread that talks to the tray, retrying once a
+/// second while the tray is unreachable.
 pub fn sync_output(parent: &Path, pending: Option<&Path>) {
-    static LAST: Mutex<Option<(PathBuf, Option<PathBuf>)>> = Mutex::new(None);
+    type Key = (PathBuf, Option<PathBuf>);
+    static QUEUED: Mutex<Option<Key>> = Mutex::new(None);
+    static WAKE: std::sync::Condvar = std::sync::Condvar::new();
+    static LAST_SEEN: Mutex<Option<Key>> = Mutex::new(None);
+    static WORKER: std::sync::Once = std::sync::Once::new();
     let key = (parent.to_owned(), pending.map(Path::to_owned));
-    let mut last = LAST.lock().unwrap();
-    if last.as_ref() == Some(&key) {
-        return;
+    {
+        let mut last = LAST_SEEN.lock().unwrap();
+        if last.as_ref() == Some(&key) {
+            return;
+        }
+        *last = Some(key.clone());
     }
-    if !tray_reachable() {
-        return;
-    }
-    let req = Request::SetOutput {
-        parent: key.0.clone(),
-        pending: key.1.clone(),
-    };
-    if request(&req).is_ok() {
-        *last = Some(key);
-    }
+    *QUEUED.lock().unwrap() = Some(key);
+    WAKE.notify_one();
+    WORKER.call_once(|| {
+        std::thread::spawn(|| {
+            let mut synced: Option<Key> = None;
+            loop {
+                let key = {
+                    let mut queued = QUEUED.lock().unwrap();
+                    loop {
+                        if let Some(key) = queued.take() {
+                            break key;
+                        }
+                        queued = WAKE.wait(queued).unwrap();
+                    }
+                };
+                if synced.as_ref() == Some(&key) {
+                    continue;
+                }
+                let req = Request::SetOutput {
+                    parent: key.0.clone(),
+                    pending: key.1.clone(),
+                };
+                if tray_reachable() && request_with(&req, Duration::from_secs(2)).is_ok() {
+                    synced = Some(key);
+                } else {
+                    // Retry later unless a newer value arrived meanwhile.
+                    std::thread::sleep(Duration::from_secs(1));
+                    QUEUED.lock().unwrap().get_or_insert(key);
+                }
+            }
+        });
+    });
 }
 
 /// Runs in the window's worker thread: mirrors a tray job's logs and stage
@@ -1167,6 +1207,9 @@ pub fn run() -> i32 {
     for stream in listener.incoming().flatten() {
         let state = state.clone();
         std::thread::spawn(move || {
+            // A stalled client must not pin a handler thread forever.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
             let mut reader = BufReader::new(&stream);
             let mut line = String::new();
             if reader.read_line(&mut line).is_err() {

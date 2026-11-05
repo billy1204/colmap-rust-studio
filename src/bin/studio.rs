@@ -83,7 +83,8 @@ struct Studio {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     use_tray: bool,
     /// The current worker mirrors a job owned by the tray process.
-    remote: bool,
+    /// Set once the job lives in the tray (by the worker after a hand-off).
+    remote: Arc<AtomicBool>,
     /// Tells a mirroring worker to stop watching, leaving the job running.
     detach: Arc<AtomicBool>,
     /// Asking whether to cancel the in-window job or keep the window open.
@@ -144,7 +145,7 @@ impl Default for Studio {
             diagnostics: None,
             closing: false,
             use_tray: cfg!(all(target_os = "linux", not(test))),
-            remote: false,
+            remote: Arc::new(AtomicBool::new(false)),
             detach: Arc::new(AtomicBool::new(false)),
             close_prompt: false,
         }
@@ -383,19 +384,30 @@ impl Studio {
         self.elapsed = Duration::ZERO;
         self.status = "Running — preparing reconstruction".into();
         let pipeline = self.pipeline;
+        self.remote = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "linux")]
         if self.use_tray {
-            match tray::hand_off(pipeline, &exe, &images, &workspace) {
-                Ok(job_id) => {
-                    self.attach_remote(job_id);
-                    return;
+            // Starting or reaching the tray can take seconds; do it on the
+            // worker thread so the window keeps drawing.
+            self.detach = Arc::new(AtomicBool::new(false));
+            let (remote, detach) = (self.remote.clone(), self.detach.clone());
+            self.worker = Some(std::thread::spawn(move || {
+                match tray::hand_off(pipeline, &exe, &images, &workspace) {
+                    Ok(job_id) => {
+                        remote.store(true, Ordering::SeqCst);
+                        let _ = tx.try_send(
+                            "Job handed to the tray; closing this window keeps it running".into(),
+                        );
+                        return tray::proxy(job_id, cancel, detach, tx, stage_tx);
+                    }
+                    Err(e) => {
+                        let _ = tx.try_send(format!("Tray unavailable ({e}); running in this window"));
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.try_send(format!("Tray unavailable ({e}); running in this window"));
-                }
-            }
+                run_job(pipeline, exe, images, workspace, cancel, tx, stage_tx)
+            }));
+            return;
         }
-        self.remote = false;
         self.worker = Some(std::thread::spawn(move || {
             run_job(pipeline, exe, images, workspace, cancel, tx, stage_tx)
         }));
@@ -407,7 +419,7 @@ impl Studio {
         let (stage_tx, stage_rx) = mpsc::channel();
         self.events = Some(rx);
         self.stage_events = Some(stage_rx);
-        self.remote = true;
+        self.remote = Arc::new(AtomicBool::new(true));
         self.detach = Arc::new(AtomicBool::new(false));
         let (cancel, detach) = (self.cancel.clone(), self.detach.clone());
         let _ = tx.try_send("Job handed to the tray; closing this window keeps it running".into());
@@ -1114,7 +1126,7 @@ impl eframe::App for Studio {
         // in-window job (no tray host) needs a decision first.
         if ctx.input(|i| i.viewport().close_requested())
             && self.worker.is_some()
-            && !self.remote
+            && !self.remote.load(Ordering::SeqCst)
             && !self.closing
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1151,7 +1163,7 @@ impl eframe::App for Studio {
 }
 impl Drop for Studio {
     fn drop(&mut self) {
-        if self.remote {
+        if self.remote.load(Ordering::SeqCst) {
             self.detach.store(true, Ordering::SeqCst);
         } else {
             self.cancel.store(true, Ordering::SeqCst);
