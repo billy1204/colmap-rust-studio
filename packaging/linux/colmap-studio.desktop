@@ -6,3 +6,4 @@ Exec=colmap-studio
 Icon=colmap-studio
 Terminal=false
 Categories=Graphics;3DGraphics;
+StartupWMClass=colmap-rust-studio

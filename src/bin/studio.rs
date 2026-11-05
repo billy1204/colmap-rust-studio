@@ -1052,6 +1052,10 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 820.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
+                    .unwrap_or_default(),
+            )
             .with_min_inner_size([900.0, 650.0])
             .with_app_id("colmap-rust-studio"),
         renderer: eframe::Renderer::Glow,
