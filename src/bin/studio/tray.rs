@@ -407,7 +407,11 @@ pub fn listen_gui(listener: UnixListener, ctx: egui::Context) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint();
-            } else if cmd.trim() == "quit" {
+            } else if cmd.trim() == "quit" || cmd.trim() == "quit-if-idle" {
+                // A close request: a window running its own job intercepts it
+                // and asks first, so bring it forward for that prompt.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 ctx.request_repaint();
             }
@@ -653,12 +657,14 @@ fn refresh_autostart() {
 }
 
 /// Ask a yes/no question in a small window (`colmap-studio --confirm`).
-fn confirm(question: &str) -> bool {
+/// None when the dialog could not be shown at all.
+fn confirm(question: &str) -> Option<bool> {
     Command::new(self_exe())
         .args(["--confirm", question])
         .stdin(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .ok()
+        .map(|s| s.success())
 }
 
 fn open_studio() {
@@ -1039,7 +1045,8 @@ impl ksni::Tray for StudioTray {
                         std::thread::spawn(move || {
                             if confirm(
                                 "Cancel the running reconstruction?\nPartial files will be kept.",
-                            ) {
+                            ) == Some(true)
+                            {
                                 let resume = state.lock().unwrap().job.as_mut().and_then(Job::cancel);
                                 resume_group(resume);
                                 refresh();
@@ -1129,12 +1136,19 @@ fn self_status(shared: &Shared) -> String {
     }
 }
 
+/// Runs on its own thread (menu callbacks must stay quick).
 fn quit(state: State) {
+    static QUITTING: AtomicBool = AtomicBool::new(false);
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let running = state.lock().unwrap().job.as_ref().is_some_and(Job::running);
+    // A dialog that can't even be shown counts as "yes": Quit must work.
+    if running && !confirm("A reconstruction is running.\nQuit the tray and cancel it?").unwrap_or(true) {
+        QUITTING.store(false, Ordering::SeqCst);
+        return;
+    }
     if running {
-        if !confirm("A reconstruction is running.\nQuit the tray and cancel it?") {
-            return;
-        }
         let resume = state.lock().unwrap().job.as_mut().and_then(Job::cancel);
         resume_group(resume);
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1142,8 +1156,18 @@ fn quit(state: State) {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    // Quit from the tray closes the Studio window too.
-    send_gui("quit");
+    // Quit from the tray closes the Studio window too, unless it is running
+    // its own in-window job, in which case it asks the user instead.
+    if send_gui("quit-if-idle") {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            // The window holds this lock until it exits.
+            if try_lock(&gui_lock()).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     // Whatever is still running after the wait is stopped, not orphaned.
     shutdown(&state, 0);
 }
