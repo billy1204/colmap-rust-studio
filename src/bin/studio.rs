@@ -1192,6 +1192,7 @@ fn main() -> eframe::Result {
             {
                 if let tray::GuiInstance::Primary(lock, listener) = instance {
                     tray::listen_gui(listener, cc.egui_ctx.clone());
+                    tray::ensure_started();
                     // Held for the window's lifetime: single instance.
                     std::mem::forget(lock);
                 }

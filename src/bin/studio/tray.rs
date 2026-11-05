@@ -144,6 +144,19 @@ fn request(req: &Request) -> Result<Response, String> {
 
 // ------------------------------------------------------------ window side
 
+/// Start the tray process in the background if it isn't already running, so
+/// the tray icon is there whenever Studio is open. Failures are ignored; a
+/// job hand-off will retry and report a missing tray host.
+pub fn ensure_started() {
+    if UnixStream::connect(tray_sock()).is_err() {
+        let _ = spawn_detached(&["--tray"]).map(|mut child| {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        });
+    }
+}
+
 /// Hand a job to the tray process, starting it if needed. Errors mean the
 /// caller should run the job in the window (e.g. no tray host).
 pub fn hand_off(
