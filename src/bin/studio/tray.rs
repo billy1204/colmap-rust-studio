@@ -190,9 +190,15 @@ pub fn hand_off(
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    // The tray may run with a different working directory and PATH (e.g. from
+    // autostart), so it always gets an absolute COLMAP path.
+    let exe = exe
+        .canonicalize()
+        .or_else(|_| std::path::absolute(exe))
+        .map_err(|e| format!("COLMAP path {}: {e}", exe.display()))?;
     let start = Request::Start {
         pipeline,
-        exe: exe.to_owned(),
+        exe,
         images: images.to_owned(),
         workspace: workspace.to_owned(),
     };
@@ -427,6 +433,42 @@ fn autostart_enabled() -> bool {
     autostart_path().is_file()
 }
 
+/// Quote an argument for a Desktop Entry `Exec` key: inside double quotes,
+/// `"`, `` ` ``, `$` and `\` are backslash-escaped, then the whole value gets
+/// the string-level escaping (`\` doubled) and `%` becomes `%%`.
+fn desktop_exec_arg(arg: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in arg.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted.replace('\\', "\\\\").replace('%', "%%")
+}
+
+/// Desktop Entry string value: escape backslash and control characters.
+fn desktop_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+}
+
+fn autostart_entry(exe: &Path) -> String {
+    let exe = exe.display().to_string();
+    format!(
+        "[Desktop Entry]\nType=Application\nName=COLMAP Studio (tray)\n\
+         Comment=Background reconstruction jobs\nTryExec={}\nExec={} --tray\n\
+         Icon=colmap-studio\nTerminal=false\nNoDisplay=true\n\
+         X-GNOME-Autostart-enabled=true\n",
+        desktop_string(&exe),
+        desktop_exec_arg(&exe),
+    )
+}
+
 fn set_autostart(on: bool) -> std::io::Result<()> {
     let path = autostart_path();
     if !on {
@@ -438,16 +480,21 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let exe = self_exe().display().to_string().replace('"', "\\\"");
-    std::fs::write(
-        path,
-        format!(
-            "[Desktop Entry]\nType=Application\nName=COLMAP Studio (tray)\n\
-             Comment=Background reconstruction jobs\nExec=\"{exe}\" --tray\n\
-             Icon=colmap-rust-studio\nTerminal=false\nNoDisplay=true\n\
-             X-GNOME-Autostart-enabled=true\n"
-        ),
-    )
+    std::fs::write(path, autostart_entry(&self_exe()))
+}
+
+/// With "Start at login" on, keep the entry pointing at the current program
+/// (e.g. after the AppImage was moved or updated).
+fn refresh_autostart() {
+    if !autostart_enabled() {
+        return;
+    }
+    let wanted = autostart_entry(&self_exe());
+    if std::fs::read_to_string(autostart_path()).ok().as_deref() != Some(wanted.as_str()) {
+        if let Err(e) = set_autostart(true) {
+            eprintln!("colmap-studio: refresh start at login: {e}");
+        }
+    }
 }
 
 /// Ask a yes/no question in a small window (`colmap-studio --confirm`).
@@ -470,7 +517,7 @@ fn open_studio() {
 
 fn notify_done(summary: &str, body: &str) {
     let _ = Command::new("notify-send")
-        .args(["-a", "COLMAP Studio", "-i", "colmap-rust-studio", summary, body])
+        .args(["-a", "COLMAP Studio", "-i", "colmap-studio", summary, body])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -623,6 +670,10 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
 
 fn handle(state: &State, req: Request) -> Response {
     match req {
+        Request::Start { exe, .. } if !exe.is_absolute() => Response::Error(format!(
+            "COLMAP path must be absolute: {}",
+            exe.display()
+        )),
         Request::Start {
             pipeline,
             exe,
@@ -933,6 +984,7 @@ pub fn run() -> i32 {
         eprintln!("colmap-studio: tray already running");
         return 0;
     };
+    refresh_autostart();
     let prefs: Prefs = std::fs::read_to_string(prefs_path())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -1033,4 +1085,16 @@ pub fn confirm_window(question: String) -> i32 {
         }),
     );
     if answer.load(Ordering::SeqCst) { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn autostart_entry_escapes_exec() {
+        let entry = autostart_entry(Path::new("/home/u/My $Apps/100%/a\"b.AppImage"));
+        assert!(entry.contains("Exec=\"/home/u/My \\\\$Apps/100%%/a\\\\\"b.AppImage\" --tray\n"), "{entry}");
+        assert!(entry.contains("TryExec=/home/u/My $Apps/100%/a\"b.AppImage\n"), "{entry}");
+        assert!(entry.contains("Icon=colmap-studio\n"));
+    }
 }

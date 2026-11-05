@@ -57,7 +57,9 @@ fn is_executable(path: &Path) -> bool {
 ///
 /// * Windows: `%USERPROFILE%\Desktop\colmap` (the portable COLMAP zip).
 /// * Linux/Unix: derived from `$COLMAP_BIN`, else the `colmap` found on
-///   `PATH` (e.g. `/usr/bin/colmap` -> `/usr`), else `/usr/local`.
+///   `PATH` (e.g. `/usr/bin/colmap` -> `/usr`), else well-known install
+///   folders such as `~/.local`, `/usr/local` and `/opt/colmap` (an autostart
+///   session often has a minimal `PATH`), else `/usr/local`.
 pub fn default_install() -> PathBuf {
     if cfg!(windows) {
         return home_dir().join("Desktop").join("colmap");
@@ -67,6 +69,7 @@ pub fn default_install() -> PathBuf {
         .filter(|p| p.is_file())
         .or_else(|| find_on_path(COLMAP_EXE));
     exe.and_then(|exe| install_root_of(&exe))
+        .or_else(|| find_installs().into_iter().next())
         .unwrap_or_else(|| PathBuf::from("/usr/local"))
 }
 
@@ -129,16 +132,40 @@ pub fn colmap_executable(install: &Path) -> PathBuf {
 /// `QT_PLUGIN_PATH` only matters for the self-contained Windows COLMAP build.
 /// System packages on Linux find their Qt plugins on their own, so pointing
 /// Qt at a non-existent folder is avoided there.
+///
+/// When Studio runs from an AppImage, the AppImage's own environment
+/// (`APPDIR`, `APPIMAGE`, and `PATH`/`LD_LIBRARY_PATH` entries inside the
+/// mount) is removed so COLMAP loads the system's libraries, not ours.
 pub fn configure_colmap_env(command: &mut std::process::Command, colmap: &Path) {
     let Some(bin) = colmap.parent() else {
         return;
     };
+    let appdir = std::env::var_os("APPDIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let outside_appdir = |p: &PathBuf| appdir.as_ref().is_none_or(|a| !p.starts_with(a));
     let mut paths = vec![bin.to_path_buf()];
     if let Some(current) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&current));
+        paths.extend(std::env::split_paths(&current).filter(outside_appdir));
     }
     if let Ok(path) = std::env::join_paths(paths) {
         command.env("PATH", path);
+    }
+    if appdir.is_some() {
+        for key in ["APPDIR", "APPIMAGE", "ARGV0", "OWD"] {
+            command.env_remove(key);
+        }
+        let libs: Vec<PathBuf> = std::env::var_os("LD_LIBRARY_PATH")
+            .map(|v| std::env::split_paths(&v).filter(outside_appdir).collect())
+            .unwrap_or_default();
+        match std::env::join_paths(libs) {
+            Ok(v) if !v.is_empty() => {
+                command.env("LD_LIBRARY_PATH", v);
+            }
+            _ => {
+                command.env_remove("LD_LIBRARY_PATH");
+            }
+        }
     }
     if let Some(root) = bin.parent() {
         let plugins = root.join("plugins");
