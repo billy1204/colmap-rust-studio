@@ -71,6 +71,18 @@ struct Studio {
     point_size: f32,
     projected_cache: Vec<([f32; 3], [u8; 3])>,
     projection_dirty: bool,
+    /// Cached egui mesh for the point preview; rebuilt only when the view changes.
+    mesh_cache: Option<std::sync::Arc<egui::Mesh>>,
+    mesh_key: Option<MeshKey>,
+    /// True when logs/stages arrived; logic() requests an immediate repaint.
+    repaint_soon: bool,
+    /// Disk existence checks, refreshed when paths change or a job ends.
+    path_stats_dirty: bool,
+    workspace_exists: bool,
+    log_exists: bool,
+    recent_exists: Vec<bool>,
+    last_synced_parent: String,
+    last_synced_project: String,
     pipeline: PipelineKind,
     dense_output: Option<PathBuf>,
     summary: Option<RunSummary>,
@@ -89,6 +101,14 @@ struct Studio {
     detach: Arc<AtomicBool>,
     /// Asking whether to cancel the in-window job or keep the window open.
     close_prompt: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct MeshKey {
+    center: [f32; 2],
+    scale: f32,
+    point_size: f32,
+    rect: [f32; 4],
 }
 impl Default for Studio {
     fn default() -> Self {
@@ -136,6 +156,15 @@ impl Default for Studio {
             point_size: 1.4,
             projected_cache: Vec::new(),
             projection_dirty: true,
+            mesh_cache: None,
+            mesh_key: None,
+            repaint_soon: false,
+            path_stats_dirty: true,
+            workspace_exists: false,
+            log_exists: false,
+            recent_exists: Vec::new(),
+            last_synced_parent: String::new(),
+            last_synced_project: String::new(),
             pipeline: PipelineKind::QuickSparse,
             dense_output: None,
             summary: None,
@@ -367,6 +396,7 @@ impl Studio {
             }
         };
         self.workspace = workspace.display().to_string();
+        self.path_stats_dirty = true;
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let (tx, rx) = mpsc::sync_channel(512);
@@ -515,15 +545,21 @@ impl Studio {
             }
         }
         if let Some(rx) = &self.events {
+            let mut got = false;
             for line in rx.try_iter().take(1000) {
                 if self.logs.len() >= 800 {
                     self.logs.pop_front();
                 }
                 self.logs.push_back(line);
+                got = true;
             }
+            self.repaint_soon |= got;
         }
         if let Some(rx) = &self.stage_events {
             let control: Vec<_> = rx.try_iter().collect();
+            if !control.is_empty() {
+                self.repaint_soon = true;
+            }
             for event in control {
                 if let PipelineEvent::Started(label) = &event {
                     self.status = format!("Running — {label}");
@@ -599,6 +635,8 @@ impl Studio {
                 }
                 Err(e) => self.status = format!("Error: {e}"),
             }
+            self.path_stats_dirty = true;
+            self.repaint_soon = true;
         }
         if self.loader.as_ref().is_some_and(|w| w.is_finished()) {
             match self
@@ -629,6 +667,7 @@ impl Studio {
                     };
                     self.cloud = Some(cloud);
                     self.projection_dirty = true;
+                    self.mesh_cache = None;
                     self.reset_view();
                 }
                 Err(e) => {
@@ -647,8 +686,11 @@ impl Studio {
         self.zoom = 3.0;
         self.pan = Vec2::ZERO;
         self.projection_dirty = true;
+        self.mesh_cache = None;
+        self.mesh_key = None;
     }
     fn record_recent_project(&mut self, pipeline: PipelineKind) {
+        self.path_stats_dirty = true;
         self.settings.install = PathBuf::from(&self.install);
         self.settings.record(settings::RecentProject {
             workspace: PathBuf::from(&self.workspace),
@@ -670,6 +712,7 @@ impl Studio {
     }
     fn reopen_recent(&mut self, project: settings::RecentProject) {
         self.workspace = project.workspace.display().to_string();
+        self.path_stats_dirty = true;
         self.output_parent = project
             .workspace
             .parent()
@@ -791,7 +834,11 @@ impl Studio {
                     folder_field(ui, "Output parent folder", &mut self.output_parent);
                     match project_folder(Path::new(&self.output_parent), &self.project_name) {
                         Ok(path) => {
-                            self.workspace = path.display().to_string();
+                            let next = path.display().to_string();
+                            if self.workspace != next {
+                                self.workspace = next;
+                                self.path_stats_dirty = true;
+                            }
                             ui.small(format!("Project folder: {}", path.display()));
                         }
                         Err(error) => {
@@ -951,6 +998,7 @@ impl Studio {
                             .unwrap_or_else(|_| fresh_workspace(Path::new(&self.output_parent)))
                             .display()
                             .to_string();
+                        self.path_stats_dirty = true;
                         self.summary = None;
                         self.stages.clear();
                         self.cloud = None;
@@ -963,8 +1011,8 @@ impl Studio {
                     egui::CollapsingHeader::new("Recent projects")
                         .default_open(true)
                         .show(ui, |ui| {
-                            for project in recent {
-                                let exists = project.workspace.is_dir();
+                            for (idx, project) in recent.into_iter().enumerate() {
+                                let exists = self.recent_exists.get(idx).copied().unwrap_or(false);
                                 let name = project.workspace.file_name().and_then(|n| n.to_str()).unwrap_or("Project");
                                 let label = if exists { name.to_owned() } else { format!("{name} — missing") };
                                 if ui.add_enabled(exists && !busy, egui::Button::new(label))
@@ -987,9 +1035,9 @@ impl Studio {
                         self.load_model(path);
                     }
                 });
-                if ui.add_enabled(Path::new(&self.workspace).is_dir(), egui::Button::new("Open workspace")).clicked() { self.open_path(PathBuf::from(&self.workspace)); }
+                if ui.add_enabled(self.workspace_exists, egui::Button::new("Open workspace")).clicked() { self.open_path(PathBuf::from(&self.workspace)); }
                 let log = PathBuf::from(&self.workspace).join("run.log");
-                if ui.add_enabled(log.is_file(), egui::Button::new("Open full log")).clicked() { self.open_text(log); }
+                if ui.add_enabled(self.log_exists, egui::Button::new("Open full log")).clicked() { self.open_text(log); }
                 ui.add_space(14.0); ui.small("Preview is a point cloud, not a solid or textured mesh. COLMAP computes; Rust manages the workflow.");
             });
         });
@@ -1068,6 +1116,12 @@ impl Studio {
         }
         let center = rect.center() + self.pan;
         let scale = rect.width().min(rect.height()) * 0.85;
+        let key = MeshKey {
+            center: [center.x, center.y],
+            scale,
+            point_size: self.point_size,
+            rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
+        };
         if let Some(cloud) = &self.cloud {
             if self.projection_dirty {
                 self.projected_cache.clear();
@@ -1080,18 +1134,25 @@ impl Studio {
                 self.projected_cache
                     .sort_unstable_by(|a, b| b.0[2].total_cmp(&a.0[2]));
                 self.projection_dirty = false;
+                self.mesh_cache = None;
             }
-            let mut mesh = egui::Mesh::default();
-            for (p, rgb) in &self.projected_cache {
-                let pos = center + Vec2::new(p[0] * scale, p[1] * scale);
-                if rect.contains(pos) {
-                    mesh.add_colored_rect(
-                        egui::Rect::from_center_size(pos, Vec2::splat(self.point_size)),
-                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-                    );
+            if self.mesh_key != Some(key) || self.mesh_cache.is_none() {
+                let mut mesh = egui::Mesh::default();
+                for (p, rgb) in &self.projected_cache {
+                    let pos = center + Vec2::new(p[0] * scale, p[1] * scale);
+                    if rect.contains(pos) {
+                        mesh.add_colored_rect(
+                            egui::Rect::from_center_size(pos, Vec2::splat(self.point_size)),
+                            Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                        );
+                    }
                 }
+                self.mesh_cache = Some(std::sync::Arc::new(mesh));
+                self.mesh_key = Some(key);
             }
-            painter.add(egui::Shape::mesh(mesh));
+            if let Some(mesh) = &self.mesh_cache {
+                painter.add(egui::Shape::mesh(mesh.clone()));
+            }
             painter.text(
                 rect.left_top() + Vec2::splat(14.0),
                 egui::Align2::LEFT_TOP,
@@ -1100,27 +1161,59 @@ impl Studio {
                 Color32::from_gray(180),
             );
         } else {
+            self.mesh_cache = None;
+            self.mesh_key = None;
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "No point cloud loaded\n\nBuild a reconstruction or open points3D.bin / fused.ply\nSparse and dense previews remain point clouds — not solid meshes",
+                "No point cloud loaded
+
+Build a reconstruction or open points3D.bin / fused.ply
+Sparse and dense previews remain point clouds — not solid meshes",
                 egui::FontId::proportional(18.0),
                 Color32::from_gray(160),
             );
         }
     }
+
+    fn refresh_path_stats(&mut self) {
+        if !self.path_stats_dirty {
+            return;
+        }
+        let workspace = PathBuf::from(&self.workspace);
+        self.workspace_exists = workspace.is_dir();
+        self.log_exists = workspace.join("run.log").is_file();
+        self.recent_exists = self
+            .settings
+            .recent
+            .iter()
+            .map(|p| p.workspace.is_dir())
+            .collect();
+        self.path_stats_dirty = false;
+    }
 }
 impl eframe::App for Studio {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.refresh_path_stats();
         #[cfg(target_os = "linux")]
-        if self.use_tray {
+        if self.use_tray
+            && (self.output_parent != self.last_synced_parent
+                || self.project_name != self.last_synced_project)
+        {
             let parent = PathBuf::from(&self.output_parent);
             let pending = project_folder(Path::new(&self.output_parent), &self.project_name).ok();
             tray::sync_output(&parent, pending.as_deref());
+            self.last_synced_parent = self.output_parent.clone();
+            self.last_synced_project = self.project_name.clone();
         }
-        if self.worker.is_some() || self.loader.is_some() || self.diagnostics_worker.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(50));
+        if self.repaint_soon {
+            self.repaint_soon = false;
+            ctx.request_repaint();
+        } else if self.worker.is_some() || self.loader.is_some() || self.diagnostics_worker.is_some()
+        {
+            // Elapsed clock only; new logs/stages set repaint_soon above.
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
         // A tray-owned job keeps running after the window closes; an
         // in-window job (no tray host) needs a decision first.
