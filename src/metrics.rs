@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::job;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelMetrics {
     pub registered_images: Option<u64>,
     pub points: Option<u64>,

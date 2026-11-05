@@ -17,7 +17,11 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+#[path = "studio/tray.rs"]
+mod tray;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum JobResult {
     SparseSuccess {
         models: Vec<PathBuf>,
@@ -75,6 +79,15 @@ struct Studio {
     diagnostics_worker: Option<JoinHandle<diagnostics::DiagnosticReport>>,
     diagnostics: Option<diagnostics::DiagnosticReport>,
     closing: bool,
+    /// Hand jobs to the `--tray` process when one can run (Linux only).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    use_tray: bool,
+    /// The current worker mirrors a job owned by the tray process.
+    remote: bool,
+    /// Tells a mirroring worker to stop watching, leaving the job running.
+    detach: Arc<AtomicBool>,
+    /// Asking whether to cancel the in-window job or keep the window open.
+    close_prompt: bool,
 }
 impl Default for Studio {
     fn default() -> Self {
@@ -130,6 +143,10 @@ impl Default for Studio {
             diagnostics_worker: None,
             diagnostics: None,
             closing: false,
+            use_tray: cfg!(all(target_os = "linux", not(test))),
+            remote: false,
+            detach: Arc::new(AtomicBool::new(false)),
+            close_prompt: false,
         }
     }
 }
@@ -214,6 +231,112 @@ fn pipeline_card(ui: &mut egui::Ui, pipeline: PipelineKind, selected: PipelineKi
     .clicked()
 }
 
+/// One reconstruction run. Used by the window directly (no tray host) and by
+/// the `--tray` background process.
+fn run_job(
+    pipeline: PipelineKind,
+    exe: PathBuf,
+    images: PathBuf,
+    workspace: PathBuf,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::SyncSender<String>,
+    stage_tx: mpsc::Sender<PipelineEvent>,
+) -> Result<JobResult, String> {
+    validate_inputs(&exe, &images, &workspace)?;
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(JobResult::Cancelled);
+    }
+    if pipeline == PipelineKind::RtxDense {
+        let check = preflight::inspect(&images, &workspace)?;
+        let _ = tx.try_send(format!(
+            "Dense preflight: {} photos, {} source, about {} working space required, {} available",
+            check.image_count,
+            format_bytes(check.source_bytes),
+            format_bytes(check.estimated_required_bytes),
+            format_bytes(check.available_bytes)
+        ));
+        if !check.has_enough_space() {
+            return Err(format!(
+                "Dense preflight needs about {} free, but only {} is available",
+                format_bytes(check.estimated_required_bytes),
+                format_bytes(check.available_bytes)
+            ));
+        }
+    }
+    if !workspace.exists() {
+        std::fs::create_dir(&workspace).map_err(|e| e.to_string())?;
+    }
+    if pipeline == PipelineKind::RtxDense {
+        return match rtx_pipeline::run_with_events(
+            &exe,
+            &images,
+            &workspace,
+            cancel.clone(),
+            tx,
+            stage_tx,
+        )? {
+            rtx_pipeline::PipelineOutcome::Completed(result) => {
+                let analyzed = if let Some(model) = result.models.first() {
+                    match metrics::analyze(&exe, model, cancel.clone()) {
+                        Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
+                        Ok(metrics::AnalysisOutcome::Cancelled) => {
+                            return Ok(JobResult::Cancelled);
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                Ok(JobResult::DenseSuccess {
+                    models: result.models,
+                    fused_clouds: result.fused_clouds,
+                    metrics: analyzed,
+                })
+            }
+            rtx_pipeline::PipelineOutcome::Cancelled => Ok(JobResult::Cancelled),
+        };
+    }
+    let stage = pipeline.stages()[0].to_owned();
+    let _ = stage_tx.send(PipelineEvent::Started(stage.clone()));
+    let mut command = reconstruction_command(&exe, &images, &workspace);
+    command.current_dir(&workspace);
+    let result =
+        match job::execute(&mut command, &workspace.join("run.log"), cancel.clone(), tx) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = stage_tx.send(PipelineEvent::Failed(stage));
+                return Err(error);
+            }
+        };
+    if result == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
+        let _ = stage_tx.send(PipelineEvent::Cancelled(stage));
+        return Ok(JobResult::Cancelled);
+    }
+    let models = match sparse_models(&workspace) {
+        Ok(models) => models,
+        Err(error) => {
+            let _ = stage_tx.send(PipelineEvent::Failed(stage));
+            return Err(error);
+        }
+    };
+    let _ = stage_tx.send(PipelineEvent::Finished(stage));
+    let analyzed = if let Some(model) = models.first() {
+        match metrics::analyze(&exe, model, cancel) {
+            Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
+            Ok(metrics::AnalysisOutcome::Cancelled) => {
+                return Ok(JobResult::Cancelled);
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    Ok(JobResult::SparseSuccess {
+        models,
+        metrics: analyzed,
+    })
+}
+
 impl Studio {
     fn start(&mut self) {
         if self.worker.is_some() || self.loader.is_some() {
@@ -260,101 +383,56 @@ impl Studio {
         self.elapsed = Duration::ZERO;
         self.status = "Running — preparing reconstruction".into();
         let pipeline = self.pipeline;
+        #[cfg(target_os = "linux")]
+        if self.use_tray {
+            match tray::hand_off(pipeline, &exe, &images, &workspace) {
+                Ok(job_id) => {
+                    self.attach_remote(job_id);
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.try_send(format!("Tray unavailable ({e}); running in this window"));
+                }
+            }
+        }
+        self.remote = false;
         self.worker = Some(std::thread::spawn(move || {
-            validate_inputs(&exe, &images, &workspace)?;
-            if cancel.load(Ordering::SeqCst) {
-                return Ok(JobResult::Cancelled);
-            }
-            if pipeline == PipelineKind::RtxDense {
-                let check = preflight::inspect(&images, &workspace)?;
-                let _ = tx.try_send(format!(
-                    "Dense preflight: {} photos, {} source, about {} working space required, {} available",
-                    check.image_count,
-                    format_bytes(check.source_bytes),
-                    format_bytes(check.estimated_required_bytes),
-                    format_bytes(check.available_bytes)
-                ));
-                if !check.has_enough_space() {
-                    return Err(format!(
-                        "Dense preflight needs about {} free, but only {} is available",
-                        format_bytes(check.estimated_required_bytes),
-                        format_bytes(check.available_bytes)
-                    ));
-                }
-            }
-            if !workspace.exists() {
-                std::fs::create_dir(&workspace).map_err(|e| e.to_string())?;
-            }
-            if pipeline == PipelineKind::RtxDense {
-                return match rtx_pipeline::run_with_events(
-                    &exe,
-                    &images,
-                    &workspace,
-                    cancel.clone(),
-                    tx,
-                    stage_tx,
-                )? {
-                    rtx_pipeline::PipelineOutcome::Completed(result) => {
-                        let analyzed = if let Some(model) = result.models.first() {
-                            match metrics::analyze(&exe, model, cancel.clone()) {
-                                Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
-                                Ok(metrics::AnalysisOutcome::Cancelled) => {
-                                    return Ok(JobResult::Cancelled);
-                                }
-                                Err(_) => None,
-                            }
-                        } else {
-                            None
-                        };
-                        Ok(JobResult::DenseSuccess {
-                            models: result.models,
-                            fused_clouds: result.fused_clouds,
-                            metrics: analyzed,
-                        })
-                    }
-                    rtx_pipeline::PipelineOutcome::Cancelled => Ok(JobResult::Cancelled),
-                };
-            }
-            let stage = pipeline.stages()[0].to_owned();
-            let _ = stage_tx.send(PipelineEvent::Started(stage.clone()));
-            let mut command = reconstruction_command(&exe, &images, &workspace);
-            command.current_dir(&workspace);
-            let result =
-                match job::execute(&mut command, &workspace.join("run.log"), cancel.clone(), tx) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let _ = stage_tx.send(PipelineEvent::Failed(stage));
-                        return Err(error);
-                    }
-                };
-            if result == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
-                let _ = stage_tx.send(PipelineEvent::Cancelled(stage));
-                return Ok(JobResult::Cancelled);
-            }
-            let models = match sparse_models(&workspace) {
-                Ok(models) => models,
-                Err(error) => {
-                    let _ = stage_tx.send(PipelineEvent::Failed(stage));
-                    return Err(error);
-                }
-            };
-            let _ = stage_tx.send(PipelineEvent::Finished(stage));
-            let analyzed = if let Some(model) = models.first() {
-                match metrics::analyze(&exe, model, cancel) {
-                    Ok(metrics::AnalysisOutcome::Completed(metrics)) => Some(metrics),
-                    Ok(metrics::AnalysisOutcome::Cancelled) => {
-                        return Ok(JobResult::Cancelled);
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-            Ok(JobResult::SparseSuccess {
-                models,
-                metrics: analyzed,
-            })
+            run_job(pipeline, exe, images, workspace, cancel, tx, stage_tx)
         }));
+    }
+    /// Mirror a job owned by the tray process in this window.
+    #[cfg(target_os = "linux")]
+    fn attach_remote(&mut self, job_id: u64) {
+        let (tx, rx) = mpsc::sync_channel(512);
+        let (stage_tx, stage_rx) = mpsc::channel();
+        self.events = Some(rx);
+        self.stage_events = Some(stage_rx);
+        self.remote = true;
+        self.detach = Arc::new(AtomicBool::new(false));
+        let (cancel, detach) = (self.cancel.clone(), self.detach.clone());
+        let _ = tx.try_send("Job handed to the tray; closing this window keeps it running".into());
+        self.worker = Some(std::thread::spawn(move || {
+            tray::proxy(job_id, cancel, detach, tx, stage_tx)
+        }));
+    }
+    /// A newly opened window picks up the tray's running job, if any.
+    #[cfg(target_os = "linux")]
+    fn attach_running(&mut self) {
+        if !self.use_tray || self.worker.is_some() {
+            return;
+        }
+        if let Some(job) = tray::running_job() {
+            self.pipeline = job.pipeline;
+            self.workspace = job.workspace.display().to_string();
+            self.stages = initial_stages(job.pipeline);
+            self.logs.clear();
+            self.summary = None;
+            self.cancel = Arc::new(AtomicBool::new(false));
+            self.started = Some(Instant::now());
+            self.elapsed = Duration::ZERO;
+            self.status = "Running in the tray — reattached".into();
+            self.attach_remote(job.job);
+        }
     }
     fn run_diagnostics(&mut self) {
         if self.diagnostics_worker.is_some() {
@@ -1026,10 +1104,15 @@ impl eframe::App for Studio {
         if self.worker.is_some() || self.loader.is_some() || self.diagnostics_worker.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.worker.is_some() {
+        // A tray-owned job keeps running after the window closes; an
+        // in-window job (no tray host) needs a decision first.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.worker.is_some()
+            && !self.remote
+            && !self.closing
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.closing = true;
-            self.cancel();
+            self.close_prompt = true;
         }
         if self.closing && self.worker.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1037,18 +1120,56 @@ impl eframe::App for Studio {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+        if self.close_prompt {
+            if self.worker.is_none() {
+                self.close_prompt = false;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            egui::Modal::new(egui::Id::new("close-during-job")).show(ui.ctx(), |ui| {
+                ui.heading("A reconstruction is running");
+                ui.label("No system tray is available, so it can't keep running without this window.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel job and close").clicked() {
+                        self.close_prompt = false;
+                        self.closing = true;
+                        self.cancel();
+                    }
+                    if ui.button("Keep window open").clicked() {
+                        self.close_prompt = false;
+                    }
+                });
+            });
+        }
     }
 }
 impl Drop for Studio {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        if self.remote {
+            self.detach.store(true, Ordering::SeqCst);
+        } else {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
 }
 fn main() -> eframe::Result {
-    let model = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut args = std::env::args_os().skip(1).peekable();
+    #[cfg(target_os = "linux")]
+    let instance = match args.peek().and_then(|a| a.to_str()) {
+        Some("--tray") => std::process::exit(tray::run()),
+        Some("--confirm") => {
+            let question = args.nth(1).map(|q| q.to_string_lossy().into_owned());
+            std::process::exit(tray::confirm_window(question.unwrap_or_default()));
+        }
+        _ => match tray::gui_instance() {
+            tray::GuiInstance::Shown => return Ok(()),
+            other => other,
+        },
+    };
+    let model = args.next().map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 820.0])
@@ -1067,6 +1188,15 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             let mut app = Studio::default();
+            #[cfg(target_os = "linux")]
+            {
+                if let tray::GuiInstance::Primary(lock, listener) = instance {
+                    tray::listen_gui(listener, cc.egui_ctx.clone());
+                    // Held for the window's lifetime: single instance.
+                    std::mem::forget(lock);
+                }
+                app.attach_running();
+            }
             if let Some(path) = model {
                 app.load_model(path);
             }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe", "dep:rfd", "dep:ksni"]
 
 [dependencies]
 eframe = { version = "=0.36.2", optional = true, default-features = false, features = ["glow", "default_fonts", "accesskit"] }
@@ -23,6 +23,10 @@ libc = "0.2"
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 eframe = { version = "=0.36.2", optional = true, default-features = false, features = ["wayland", "x11"] }
 rfd = { version = "=0.17.2", optional = true, default-features = false, features = ["xdg-portal", "wayland"] }
+
+# Background tray process for colmap-studio (StatusNotifierItem over D-Bus).
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", optional = true, default-features = false, features = ["blocking", "tokio"] }
 
 [[bin]]
 name = "colmap-studio"

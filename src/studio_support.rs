@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PipelineKind {
     #[default]
     QuickSparse,
@@ -58,7 +58,7 @@ pub struct StageView {
     pub status: StageStatus,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PipelineEvent {
     Started(String),
     Finished(String),
