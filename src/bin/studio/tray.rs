@@ -583,6 +583,33 @@ fn prefs_of(shared: &Shared) -> Prefs {
     }
 }
 
+/// Read tray.json. A missing file means defaults; an unreadable one is
+/// reported and moved aside to tray.json.bad, so the next save doesn't
+/// silently replace the user's settings.
+fn load_prefs() -> Prefs {
+    let path = prefs_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Prefs::default(),
+        Err(e) => {
+            eprintln!("colmap-studio: can't read {}: {e}; using default tray settings", path.display());
+            return Prefs::default();
+        }
+    };
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        let bad = path.with_extension("json.bad");
+        let kept = match std::fs::rename(&path, &bad) {
+            Ok(()) => format!("moved it to {}", bad.display()),
+            Err(e) => format!("couldn't move it aside: {e}"),
+        };
+        eprintln!(
+            "colmap-studio: {} is not valid tray settings ({e}); using defaults and {kept}",
+            path.display()
+        );
+        Prefs::default()
+    })
+}
+
 fn save_prefs(prefs: &Prefs) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let path = prefs_path();
@@ -1284,10 +1311,7 @@ pub fn run() -> i32 {
         return EXIT_ALREADY_RUNNING;
     };
     refresh_autostart();
-    let prefs: Prefs = std::fs::read_to_string(prefs_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    let prefs = load_prefs();
     let state: State = Arc::new(Mutex::new(Shared {
         notify: prefs.notify,
         output_parent: prefs.output_parent,
