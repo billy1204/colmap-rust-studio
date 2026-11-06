@@ -24,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -492,6 +492,7 @@ fn shutdown(state: &State, code: i32) -> ! {
     if let Some(pgid) = pgid {
         stop_group(pgid);
     }
+    flush_save(state);
     let _ = std::fs::remove_file(tray_sock());
     std::process::exit(code);
 }
@@ -583,37 +584,77 @@ fn prefs_of(shared: &Shared) -> Prefs {
 }
 
 fn save_prefs(prefs: &Prefs) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
     let path = prefs_path();
+    // Write a temp file and rename it over tray.json, so a crash or kill
+    // mid-write never leaves a torn file that loads as defaults.
+    let tmp = path.with_extension("json.tmp");
     let result = serde_json::to_string_pretty(prefs)
         .map_err(std::io::Error::other)
         .and_then(|text| {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(&path, text)
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, &path)
         });
     if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
         let msg = format!("Couldn't save tray settings to {}: {e}", path.display());
         eprintln!("colmap-studio: {msg}");
-        notify_done("COLMAP Studio", &msg);
+        // Pop up once per run, and only if the user wants notifications.
+        if prefs.notify && !WARNED.swap(true, Ordering::SeqCst) {
+            notify_done("COLMAP Studio", &msg);
+        }
     }
 }
 
-/// Bumped on every debounced save request; only the newest one writes.
-static SAVE_GEN: AtomicU64 = AtomicU64::new(0);
+/// How long the saver waits for more changes before writing.
+const SAVE_DELAY: Duration = Duration::from_millis(400);
 
-/// Save prefs once the window stops sending path changes for a moment,
-/// so typing a project name doesn't write the file on every keystroke.
+/// Set when prefs changed but haven't been written yet.
+static SAVE_PENDING: AtomicBool = AtomicBool::new(false);
+/// Held across snapshot + write, so saves land in order.
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+static SAVER: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+/// Ask the saver thread to write prefs once changes stop for a moment, so
+/// typing a project name doesn't write the file on every keystroke. The
+/// only way prefs are saved, apart from `flush_save` on exit; safe to call
+/// while holding the state lock.
 fn schedule_save(state: &State) {
-    let generation = SAVE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let state = state.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        if SAVE_GEN.load(Ordering::SeqCst) == generation {
-            let prefs = prefs_of(&state.lock().unwrap());
-            save_prefs(&prefs);
-        }
+    SAVE_PENDING.store(true, Ordering::SeqCst);
+    let saver = SAVER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<()>();
+        let state = state.clone();
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                while rx.recv_timeout(SAVE_DELAY).is_ok() {}
+                let _guard = SAVE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if SAVE_PENDING.swap(false, Ordering::SeqCst) {
+                    // Snapshot now, not when the change was requested, so
+                    // the newest state is what gets written.
+                    let prefs = prefs_of(&state.lock().unwrap());
+                    save_prefs(&prefs);
+                }
+            }
+        });
+        tx
     });
+    let _ = saver.send(());
+}
+
+/// Write a save still waiting on the debounce. Used on exit; try_lock so a
+/// wedged thread can't hang shutdown.
+fn flush_save(state: &State) {
+    let Ok(_guard) = SAVE_LOCK.try_lock() else { return };
+    if !SAVE_PENDING.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let Ok(shared) = state.try_lock() else { return };
+    let prefs = prefs_of(&shared);
+    drop(shared);
+    save_prefs(&prefs);
 }
 
 fn autostart_path() -> PathBuf {
@@ -757,7 +798,7 @@ fn short_path(path: &Path, max: usize) -> String {
 }
 
 /// Open-folder target, in priority order:
-/// running job workspace → pending project → output parent → last finished workspace.
+/// running job workspace → pending project → last finished workspace → output parent.
 fn open_target(shared: &Shared) -> Option<PathBuf> {
     let running = shared
         .job
@@ -768,7 +809,7 @@ fn open_target(shared: &Shared) -> Option<PathBuf> {
         .last_workspace
         .as_ref()
         .or_else(|| shared.job.as_ref().map(|j| &j.workspace));
-    [running, shared.pending_project.as_ref(), shared.output_parent.as_ref(), finished]
+    [running, shared.pending_project.as_ref(), finished, shared.output_parent.as_ref()]
         .into_iter()
         .flatten()
         .find(|p| p.is_dir())
@@ -877,8 +918,7 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
             }
             if let Some(workspace) = workspace {
                 shared.last_workspace = Some(workspace);
-                let prefs = prefs_of(&shared);
-                std::thread::spawn(move || save_prefs(&prefs));
+                schedule_save(&worker_state);
             }
             shared.notify
         };
@@ -1048,7 +1088,9 @@ impl ksni::Tray for StudioTray {
                 self_status(&shared),
                 job.is_some_and(Job::running),
                 job.is_some_and(|j| j.paused),
-                job.is_some_and(|j| j.running() && j.pgid.is_some()),
+                // Before the first COLMAP process starts, pausing just sets
+                // the flag and the log thread stops the process on spawn.
+                job.is_some_and(|j| j.running() && !j.cancel.load(Ordering::SeqCst)),
                 open_target(&shared),
                 shared.notify,
             )
@@ -1134,9 +1176,8 @@ impl ksni::Tray for StudioTray {
                 activate: Box::new(|t: &mut Self| {
                     let mut shared = t.state.lock().unwrap();
                     shared.notify = !shared.notify;
-                    let prefs = prefs_of(&shared);
                     drop(shared);
-                    save_prefs(&prefs);
+                    schedule_save(&t.state);
                 }),
                 ..Default::default()
             }
