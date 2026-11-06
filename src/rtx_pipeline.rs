@@ -155,7 +155,7 @@ pub fn dense_stages(
         let fused = dense.join("fused.ply").to_string_lossy().into_owned();
         stages.push(stage(
             colmap,
-            &format!("Model {number}: image undistortion"),
+            &format!("Model {number}: Image undistortion"),
             &format!("10-model-{number}-undistort.log"),
             vec![
                 "image_undistorter".into(),
@@ -203,7 +203,7 @@ pub fn dense_stages(
         ));
         stages.push(stage(
             colmap,
-            &format!("Model {number}: dense point fusion"),
+            &format!("Model {number}: CPU dense point fusion"),
             &format!("12-model-{number}-fusion.log"),
             vec![
                 "stereo_fusion".into(),
@@ -465,6 +465,37 @@ mod tests {
         );
         std::fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    fn stage_names_match_the_stage_list_the_window_shows() {
+        // The window lights up stages by these names; a mismatch leaves a
+        // stage stuck at "pending" for the whole run.
+        let shown = crate::studio_support::PipelineKind::RtxDense.stages();
+        let workspace =
+            std::env::temp_dir().join(format!("colmap-stage-names-{}", std::process::id()));
+        let model = workspace.join("sparse").join("0");
+        let names: Vec<String> =
+            sparse_stages(Path::new("colmap"), Path::new("images"), &workspace)
+                .into_iter()
+                .chain(
+                    dense_stages(
+                        Path::new("colmap"),
+                        Path::new("images"),
+                        &workspace,
+                        &[model],
+                    )
+                    .unwrap(),
+                )
+                .map(|stage| stage.name)
+                .collect();
+        assert_eq!(names.len(), shown.len());
+        for name in &names {
+            let base = name
+                .split_once(": ")
+                .map_or(name.as_str(), |(_, rest)| rest);
+            assert!(shown.contains(&base), "{name:?} is not in {shown:?}");
+        }
+    }
+
     #[test]
     fn rejects_model_outside_workspace_or_nonnumeric_name() {
         let w = Path::new("C:/work");

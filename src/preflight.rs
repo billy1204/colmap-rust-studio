@@ -27,14 +27,7 @@ pub fn inspect(images: &Path, workspace: &Path) -> Result<DensePreflight, String
     let mut source_bytes = 0u64;
     for entry in fs::read_dir(images).map_err(|e| format!("Cannot scan photos: {e}"))? {
         let entry = entry.map_err(|e| format!("Cannot read photo entry: {e}"))?;
-        let path = entry.path();
-        let is_image = path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png" | "tif" | "tiff" | "bmp"
-            )
-        });
-        if is_image {
+        if is_photo(&entry.path()) {
             image_count += 1;
             source_bytes = source_bytes.saturating_add(
                 entry
@@ -52,6 +45,27 @@ pub fn inspect(images: &Path, workspace: &Path) -> Result<DensePreflight, String
         estimated_required_bytes: estimate_dense_bytes(source_bytes),
         available_bytes: available_bytes(&volume_path)?,
     })
+}
+
+/// A file name COLMAP will read as a photo.
+fn is_photo(path: &Path) -> bool {
+    path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "tif" | "tiff" | "bmp"
+        )
+    })
+}
+
+/// Number of photos directly in `images`, or None if it can't be read.
+pub fn count_photos(images: &Path) -> Option<u64> {
+    let entries = fs::read_dir(images).ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter(|entry| is_photo(&entry.path()))
+            .count() as u64,
+    )
 }
 
 fn existing_ancestor(path: &Path) -> Option<PathBuf> {

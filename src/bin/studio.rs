@@ -5,7 +5,8 @@ use colmap_launcher::{
     platform, ply, point_cloud, preflight, reconstruction_command, rtx_pipeline, settings,
     sparse_models,
     studio_support::{
-        PipelineEvent, PipelineKind, StageStatus, StageView, apply_stage_event, initial_stages,
+        PipelineEvent, PipelineKind, StageProgress, StageStatus, StageView, apply_progress,
+        apply_stage_event, initial_stages, parse_progress,
     },
     validate_inputs,
 };
@@ -70,6 +71,8 @@ struct Studio {
     loader: Option<JoinHandle<Result<point_cloud::Cloud, String>>>,
     camera: Camera,
     gizmo_mode: gizmo::Mode,
+    /// Photos in the current run, to show mapper progress as a fraction.
+    run_photos: Option<u64>,
     /// Gizmo shown: right-click on the preview shows it, a left-click hides it.
     gizmo_visible: bool,
     /// Gizmo handle being dragged, if any.
@@ -159,6 +162,7 @@ impl Default for Studio {
             loader: None,
             camera: Camera::default(),
             gizmo_mode: gizmo::Mode::default(),
+            run_photos: None,
             gizmo_visible: false,
             gizmo_drag: None,
             point_size: 1.4,
@@ -203,6 +207,27 @@ fn help_alpha(elapsed: Duration) -> Option<f32> {
     const FADE: f32 = 0.8;
     let t = elapsed.as_secs_f32();
     (t < SHOW + FADE).then(|| (1.0 - (t - SHOW) / FADE).min(1.0))
+}
+
+/// Bar under the running stage: COLMAP's own count and a rough time left,
+/// or an animated bar until COLMAP reports something.
+fn stage_progress_bar(ui: &mut egui::Ui, progress: Option<&StageProgress>) {
+    let mut text = progress.map_or_else(|| "Starting…".to_owned(), |p| p.detail.clone());
+    if let Some(left) = progress.and_then(|p| p.remaining()) {
+        let secs = left.as_secs();
+        text += &if secs >= 60 {
+            format!("  •  ~{}m {:02}s left", secs / 60, secs % 60)
+        } else {
+            format!("  •  ~{secs}s left")
+        };
+    }
+    let fraction = progress.and_then(|p| p.fraction);
+    ui.add(
+        egui::ProgressBar::new(fraction.unwrap_or(0.0))
+            .animate(fraction.is_none())
+            .desired_height(14.0)
+            .text(RichText::new(text).size(10.5)),
+    );
 }
 
 fn project_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
@@ -421,6 +446,7 @@ impl Studio {
         self.events = Some(rx);
         self.stage_events = Some(stage_rx);
         self.stages = initial_stages(self.pipeline);
+        self.run_photos = preflight::count_photos(&images);
         self.logs.clear();
         self.cloud = None;
         self.model_path = None;
@@ -485,6 +511,8 @@ impl Studio {
             self.pipeline = job.pipeline;
             self.workspace = job.workspace.display().to_string();
             self.stages = initial_stages(job.pipeline);
+            // The tray doesn't report the photo folder; the mapper shows a count.
+            self.run_photos = None;
             self.logs.clear();
             self.summary = None;
             self.cancel = Arc::new(AtomicBool::new(false));
@@ -567,6 +595,9 @@ impl Studio {
             for line in rx.try_iter().take(1000) {
                 if self.logs.len() >= 800 {
                     self.logs.pop_front();
+                }
+                if let Some(progress) = parse_progress(&line) {
+                    apply_progress(&mut self.stages, progress, self.run_photos);
                 }
                 self.logs.push_back(line);
                 got = true;
@@ -965,6 +996,9 @@ impl Studio {
                                 StageStatus::Skipped => ("–", Color32::DARK_GRAY),
                             };
                             ui.label(RichText::new(format!("{icon}  {}", stage.label)).color(color).size(11.0));
+                            if stage.status == StageStatus::Running {
+                                stage_progress_bar(ui, stage.progress.as_ref());
+                            }
                         }
                     }
                     ui.add_space(14.0);
