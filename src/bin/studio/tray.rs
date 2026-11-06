@@ -587,8 +587,11 @@ fn prefs_of(shared: &Shared) -> Prefs {
 /// reported and moved aside to tray.json.bad, so the next save doesn't
 /// silently replace the user's settings.
 fn load_prefs() -> Prefs {
-    let path = prefs_path();
-    let text = match std::fs::read_to_string(&path) {
+    load_prefs_from(&prefs_path())
+}
+
+fn load_prefs_from(path: &Path) -> Prefs {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Prefs::default(),
         Err(e) => {
@@ -598,7 +601,7 @@ fn load_prefs() -> Prefs {
     };
     serde_json::from_str(&text).unwrap_or_else(|e| {
         let bad = path.with_extension("json.bad");
-        let kept = match std::fs::rename(&path, &bad) {
+        let kept = match std::fs::rename(path, &bad) {
             Ok(()) => format!("moved it to {}", bad.display()),
             Err(e) => format!("couldn't move it aside: {e}"),
         };
@@ -613,8 +616,19 @@ fn load_prefs() -> Prefs {
 fn save_prefs(prefs: &Prefs) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let path = prefs_path();
-    // Write a temp file and rename it over tray.json, so a crash or kill
-    // mid-write never leaves a torn file that loads as defaults.
+    if let Err(e) = write_prefs(&path, prefs) {
+        let msg = format!("Couldn't save tray settings to {}: {e}", path.display());
+        eprintln!("colmap-studio: {msg}");
+        // Pop up once per run, and only if the user wants notifications.
+        if prefs.notify && !WARNED.swap(true, Ordering::SeqCst) {
+            notify_done("COLMAP Studio", &msg);
+        }
+    }
+}
+
+/// Write a temp file and rename it over `path`, so a crash or kill
+/// mid-write never leaves a torn file that loads as defaults.
+fn write_prefs(path: &Path, prefs: &Prefs) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let result = serde_json::to_string_pretty(prefs)
         .map_err(std::io::Error::other)
@@ -623,17 +637,12 @@ fn save_prefs(prefs: &Prefs) {
                 std::fs::create_dir_all(dir)?;
             }
             std::fs::write(&tmp, text)?;
-            std::fs::rename(&tmp, &path)
+            std::fs::rename(&tmp, path)
         });
-    if let Err(e) = result {
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        let msg = format!("Couldn't save tray settings to {}: {e}", path.display());
-        eprintln!("colmap-studio: {msg}");
-        // Pop up once per run, and only if the user wants notifications.
-        if prefs.notify && !WARNED.swap(true, Ordering::SeqCst) {
-            notify_done("COLMAP Studio", &msg);
-        }
     }
+    result
 }
 
 /// How long the saver waits for more changes before writing.
@@ -1425,5 +1434,153 @@ mod tests {
         assert!(entry.contains("Exec=\"/home/u/My \\\\$Apps/100%%/a\\\\\"b.AppImage\" --tray\n"), "{entry}");
         assert!(entry.contains("TryExec=/home/u/My $Apps/100%/a\"b.AppImage\n"), "{entry}");
         assert!(entry.contains("Icon=colmap-studio\n"));
+    }
+
+    /// Fresh, empty folder under the system temp dir, unique per test.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("colmap-tray-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn job(workspace: &Path, running: bool) -> Job {
+        Job {
+            id: 1,
+            pipeline: PipelineKind::QuickSparse,
+            workspace: workspace.to_owned(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            logs: VecDeque::new(),
+            log_base: 0,
+            stages: Vec::new(),
+            stage: String::new(),
+            pgid: None,
+            paused: false,
+            result: (!running).then(|| Err("done".to_owned())),
+        }
+    }
+
+    #[test]
+    fn prefs_round_trip_without_leftovers() {
+        let dir = temp_dir("round-trip");
+        let path = dir.join("sub").join("tray.json");
+        let prefs = Prefs {
+            notify: true,
+            output_parent: Some("/out".into()),
+            last_workspace: Some("/out/proj".into()),
+        };
+        write_prefs(&path, &prefs).unwrap();
+        // A second write replaces the first in place.
+        write_prefs(&path, &Prefs { notify: false, ..prefs }).unwrap();
+        let loaded = load_prefs_from(&path);
+        assert!(!loaded.notify);
+        assert_eq!(loaded.output_parent.as_deref(), Some(Path::new("/out")));
+        assert_eq!(loaded.last_workspace.as_deref(), Some(Path::new("/out/proj")));
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["tray.json"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_prefs_reports_failure() {
+        let dir = temp_dir("write-fail");
+        // The parent "folder" is a file, so the write can't succeed.
+        std::fs::write(dir.join("blocker"), "").unwrap();
+        let path = dir.join("blocker").join("tray.json");
+        assert!(write_prefs(&path, &Prefs::default()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_prefs_load_as_defaults() {
+        let dir = temp_dir("missing");
+        let prefs = load_prefs_from(&dir.join("tray.json"));
+        assert!(!prefs.notify && prefs.output_parent.is_none() && prefs.last_workspace.is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_prefs_without_new_fields_still_load() {
+        let dir = temp_dir("old-format");
+        let path = dir.join("tray.json");
+        std::fs::write(&path, r#"{"notify":true}"#).unwrap();
+        let prefs = load_prefs_from(&path);
+        assert!(prefs.notify && prefs.output_parent.is_none() && prefs.last_workspace.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_prefs_are_moved_aside() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("tray.json");
+        std::fs::write(&path, r#"{"notify":true,"output_par"#).unwrap();
+        let prefs = load_prefs_from(&path);
+        assert!(!prefs.notify);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(dir.join("tray.json.bad")).unwrap(), r#"{"notify":true,"output_par"#);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_target_priority() {
+        let dir = temp_dir("open-target");
+        let [running, pending, last, parent] = ["running", "pending", "last", "parent"].map(|n| {
+            let p = dir.join(n);
+            std::fs::create_dir(&p).unwrap();
+            p
+        });
+        let mut shared = Shared {
+            job: Some(job(&running, true)),
+            pending_project: Some(pending.clone()),
+            last_workspace: Some(last.clone()),
+            output_parent: Some(parent.clone()),
+            ..Default::default()
+        };
+        assert_eq!(open_target(&shared), Some(running.clone()));
+        shared.job = Some(job(&running, false));
+        assert_eq!(open_target(&shared), Some(pending.clone()));
+        shared.pending_project = None;
+        assert_eq!(open_target(&shared), Some(last.clone()));
+        // Folders that no longer exist are skipped.
+        std::fs::remove_dir(&last).unwrap();
+        assert_eq!(open_target(&shared), Some(parent.clone()));
+        // Without a saved last workspace, a finished job's folder is used.
+        shared.last_workspace = None;
+        assert_eq!(open_target(&shared), Some(running));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_resumes_only_a_paused_job() {
+        let mut j = job(Path::new("/w"), true);
+        j.pgid = Some(42);
+        assert_eq!(j.cancel(), None);
+        assert!(j.cancel.load(Ordering::SeqCst));
+        j.paused = true;
+        assert_eq!(j.cancel(), Some(42));
+        assert!(!j.paused);
+    }
+
+    #[test]
+    fn request_wire_format() {
+        // The window and the tray can be different builds (e.g. an old tray
+        // still running after an update), so the JSON shape must stay put.
+        let req: Request = serde_json::from_str(r#"{"cmd":"set_output","parent":"/out","pending":null}"#).unwrap();
+        assert!(matches!(req, Request::SetOutput { ref parent, pending: None } if parent == Path::new("/out")));
+        let req: Request = serde_json::from_str(r#"{"cmd":"status","job":0,"log_from":3,"stage_from":1}"#).unwrap();
+        assert!(matches!(req, Request::Status { job: 0, log_from: 3, stage_from: 1 }));
+        let req: Request = serde_json::from_str(r#"{"cmd":"cancel","job":7}"#).unwrap();
+        assert!(matches!(req, Request::Cancel { job: 7 }));
+        assert_eq!(serde_json::to_string(&Response::Started(5)).unwrap(), r#"{"Started":5}"#);
+        assert_eq!(serde_json::to_string(&Response::Ok).unwrap(), r#""Ok""#);
+    }
+
+    #[test]
+    fn short_text_and_paths() {
+        assert_eq!(short("one\ntwo", 10), "one");
+        assert_eq!(short("abcdef", 3), "abc…");
+        assert_eq!(short_path(Path::new("/a/b"), 10), "/a/b");
+        assert_eq!(short_path(Path::new("/home/user/project"), 8), "…project");
     }
 }
