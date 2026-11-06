@@ -85,7 +85,10 @@ pub fn find_installs() -> Vec<PathBuf> {
     }
     let home = home_dir();
     let roots: Vec<PathBuf> = if cfg!(windows) {
-        vec![home.join("Desktop").join("colmap"), PathBuf::from(r"C:\Program Files\COLMAP")]
+        vec![
+            home.join("Desktop").join("colmap"),
+            PathBuf::from(r"C:\Program Files\COLMAP"),
+        ]
     } else {
         vec![
             home.join(".local"),

@@ -48,8 +48,18 @@ fn output_with_timeout(
             bytes
         })
     };
-    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
@@ -104,7 +114,10 @@ pub fn detect_colmap_version(text: &str) -> Option<String> {
 /// COLMAP's help banner (the first line starting with "COLMAP") ends with
 /// "with CUDA)" or "without CUDA)". Other help text is ignored.
 pub fn detect_cuda(text: &str) -> Option<bool> {
-    let banner = text.lines().map(str::trim).find(|l| l.starts_with("COLMAP "))?;
+    let banner = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("COLMAP "))?;
     if banner.contains("without CUDA") {
         Some(false)
     } else if banner.contains("with CUDA") {
@@ -199,7 +212,10 @@ mod tests {
     #[cfg(unix)]
     fn output_with_timeout_drains_large_output() {
         let mut c = Command::new("sh");
-        c.args(["-c", "head -c 1000000 /dev/zero; head -c 1000000 /dev/zero 1>&2"]);
+        c.args([
+            "-c",
+            "head -c 1000000 /dev/zero; head -c 1000000 /dev/zero 1>&2",
+        ]);
         let out = output_with_timeout(&mut c, Duration::from_secs(10)).unwrap();
         assert_eq!(out.stdout.len(), 1_000_000);
         assert_eq!(out.stderr.len(), 1_000_000);

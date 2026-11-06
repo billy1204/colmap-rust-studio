@@ -88,13 +88,13 @@ fn wait_for_tray(mut child: std::process::Child, deadline: Instant) -> Result<()
             reap(child);
             return Ok(());
         }
-        if exited.is_none() {
-            if let Ok(Some(status)) = child.try_wait() {
-                match status.code() {
-                    Some(EXIT_ALREADY_RUNNING) => exited = Some(status),
-                    Some(2) => return Err("no system tray host".into()),
-                    _ => return Err(format!("tray process exited ({status})")),
-                }
+        if exited.is_none()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            match status.code() {
+                Some(EXIT_ALREADY_RUNNING) => exited = Some(status),
+                Some(2) => return Err("no system tray host".into()),
+                _ => return Err(format!("tray process exited ({status})")),
             }
         }
         if Instant::now() > deadline {
@@ -166,6 +166,9 @@ enum Request {
     },
 }
 
+// Built once per request and serialized straight away, so the size of the
+// Status variant doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 enum Response {
     Started(u64),
@@ -595,7 +598,10 @@ fn load_prefs_from(path: &Path) -> Prefs {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Prefs::default(),
         Err(e) => {
-            eprintln!("colmap-studio: can't read {}: {e}; using default tray settings", path.display());
+            eprintln!(
+                "colmap-studio: can't read {}: {e}; using default tray settings",
+                path.display()
+            );
             return Prefs::default();
         }
     };
@@ -666,7 +672,9 @@ fn schedule_save(state: &State) {
         std::thread::spawn(move || {
             while rx.recv().is_ok() {
                 while rx.recv_timeout(SAVE_DELAY).is_ok() {}
-                let _guard = SAVE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _guard = SAVE_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if SAVE_PENDING.swap(false, Ordering::SeqCst) {
                     // Snapshot now, not when the change was requested, so
                     // the newest state is what gets written.
@@ -683,7 +691,9 @@ fn schedule_save(state: &State) {
 /// Write a save still waiting on the debounce. Used on exit; try_lock so a
 /// wedged thread can't hang shutdown.
 fn flush_save(state: &State) {
-    let Ok(_guard) = SAVE_LOCK.try_lock() else { return };
+    let Ok(_guard) = SAVE_LOCK.try_lock() else {
+        return;
+    };
     if !SAVE_PENDING.swap(false, Ordering::SeqCst) {
         return;
     }
@@ -762,10 +772,10 @@ fn refresh_autostart() {
         return;
     }
     let wanted = autostart_entry(&self_exe());
-    if std::fs::read_to_string(autostart_path()).ok().as_deref() != Some(wanted.as_str()) {
-        if let Err(e) = set_autostart(true) {
-            eprintln!("colmap-studio: refresh start at login: {e}");
-        }
+    if std::fs::read_to_string(autostart_path()).ok().as_deref() != Some(wanted.as_str())
+        && let Err(e) = set_autostart(true)
+    {
+        eprintln!("colmap-studio: refresh start at login: {e}");
     }
 }
 
@@ -829,7 +839,14 @@ fn short_path(path: &Path, max: usize) -> String {
         return text;
     }
     let keep = max.saturating_sub(1);
-    let tail: String = text.chars().rev().take(keep).collect::<String>().chars().rev().collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("…{tail}")
 }
 
@@ -845,11 +862,16 @@ fn open_target(shared: &Shared) -> Option<PathBuf> {
         .last_workspace
         .as_ref()
         .or_else(|| shared.job.as_ref().map(|j| &j.workspace));
-    [running, shared.pending_project.as_ref(), finished, shared.output_parent.as_ref()]
-        .into_iter()
-        .flatten()
-        .find(|p| p.is_dir())
-        .cloned()
+    [
+        running,
+        shared.pending_project.as_ref(),
+        finished,
+        shared.output_parent.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.is_dir())
+    .cloned()
 }
 
 fn open_folder(path: &Path) {
@@ -860,7 +882,13 @@ fn open_folder(path: &Path) {
     }
 }
 
-fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBuf, workspace: PathBuf) -> Response {
+fn start_job(
+    state: &State,
+    pipeline: PipelineKind,
+    exe: PathBuf,
+    images: PathBuf,
+    workspace: PathBuf,
+) -> Response {
     let mut shared = state.lock().unwrap();
     if shared.job.as_ref().is_some_and(Job::running) {
         return Response::Error("A reconstruction is already running in the tray".into());
@@ -889,7 +917,9 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
         for line in rx {
             let mut stop = None;
             let mut shared = logs_state.lock().unwrap();
-            let Some(job) = shared.job.as_mut().filter(|j| j.id == id) else { continue };
+            let Some(job) = shared.job.as_mut().filter(|j| j.id == id) else {
+                continue;
+            };
             if let Some(pid) = line
                 .strip_prefix("Started COLMAP process ")
                 .and_then(|p| p.trim().parse::<i32>().ok())
@@ -916,7 +946,13 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
     let stage_state = state.clone();
     let stages = std::thread::spawn(move || {
         for event in stage_rx {
-            if let Some(job) = stage_state.lock().unwrap().job.as_mut().filter(|j| j.id == id) {
+            if let Some(job) = stage_state
+                .lock()
+                .unwrap()
+                .job
+                .as_mut()
+                .filter(|j| j.id == id)
+            {
                 if let PipelineEvent::Started(label) = &event {
                     job.stage = label.clone();
                 }
@@ -935,8 +971,14 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
         let _ = logs.join();
         let _ = stages.join();
         let (summary, body) = match &result {
-            Ok(JobResult::Cancelled) => ("Reconstruction cancelled", "Partial files were kept".to_owned()),
-            Ok(_) => ("Reconstruction complete", "Open COLMAP Studio to view the result".to_owned()),
+            Ok(JobResult::Cancelled) => (
+                "Reconstruction cancelled",
+                "Partial files were kept".to_owned(),
+            ),
+            Ok(_) => (
+                "Reconstruction complete",
+                "Open COLMAP Studio to view the result".to_owned(),
+            ),
             Err(e) => ("Reconstruction failed", short(e, 200)),
         };
         let notify = {
@@ -968,10 +1010,9 @@ fn start_job(state: &State, pipeline: PipelineKind, exe: PathBuf, images: PathBu
 
 fn handle(state: &State, req: Request) -> Response {
     match req {
-        Request::Start { exe, .. } if !exe.is_absolute() => Response::Error(format!(
-            "COLMAP path must be absolute: {}",
-            exe.display()
-        )),
+        Request::Start { exe, .. } if !exe.is_absolute() => {
+            Response::Error(format!("COLMAP path must be absolute: {}", exe.display()))
+        }
         Request::Start {
             pipeline,
             exe,
@@ -1149,10 +1190,17 @@ impl ksni::Tray for StudioTray {
                     label: "Pause".into(),
                     checked: paused,
                     activate: Box::new(|t: &mut Self| {
-                        let toggled = t.state.lock().unwrap().job.as_mut().filter(|j| j.running()).map(|j| {
-                            j.paused = !j.paused;
-                            (j.pgid, j.paused)
-                        });
+                        let toggled = t
+                            .state
+                            .lock()
+                            .unwrap()
+                            .job
+                            .as_mut()
+                            .filter(|j| j.running())
+                            .map(|j| {
+                                j.paused = !j.paused;
+                                (j.pgid, j.paused)
+                            });
                         if let Some((Some(pgid), paused)) = toggled {
                             let sig = if paused { libc::SIGSTOP } else { libc::SIGCONT };
                             // SAFETY: signals the job's COLMAP process group.
@@ -1177,7 +1225,8 @@ impl ksni::Tray for StudioTray {
                                 "Cancel the running reconstruction?\nPartial files will be kept.",
                             ) == Some(true)
                             {
-                                let resume = state.lock().unwrap().job.as_mut().and_then(Job::cancel);
+                                let resume =
+                                    state.lock().unwrap().job.as_mut().and_then(Job::cancel);
                                 resume_group(resume);
                                 refresh();
                             }
@@ -1274,7 +1323,9 @@ fn quit(state: State) {
     }
     let running = state.lock().unwrap().job.as_ref().is_some_and(Job::running);
     // A dialog that can't even be shown counts as "yes": Quit must work.
-    if running && !confirm("A reconstruction is running.\nQuit the tray and cancel it?").unwrap_or(true) {
+    if running
+        && !confirm("A reconstruction is running.\nQuit the tray and cancel it?").unwrap_or(true)
+    {
         QUITTING.store(false, Ordering::SeqCst);
         return;
     }
@@ -1282,7 +1333,9 @@ fn quit(state: State) {
         let resume = state.lock().unwrap().job.as_mut().and_then(Job::cancel);
         resume_group(resume);
         let deadline = Instant::now() + Duration::from_secs(30);
-        while state.lock().unwrap().job.as_ref().is_some_and(Job::running) && Instant::now() < deadline {
+        while state.lock().unwrap().job.as_ref().is_some_and(Job::running)
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -1431,14 +1484,21 @@ mod tests {
     #[test]
     fn autostart_entry_escapes_exec() {
         let entry = autostart_entry(Path::new("/home/u/My $Apps/100%/a\"b.AppImage"));
-        assert!(entry.contains("Exec=\"/home/u/My \\\\$Apps/100%%/a\\\\\"b.AppImage\" --tray\n"), "{entry}");
-        assert!(entry.contains("TryExec=/home/u/My $Apps/100%/a\"b.AppImage\n"), "{entry}");
+        assert!(
+            entry.contains("Exec=\"/home/u/My \\\\$Apps/100%%/a\\\\\"b.AppImage\" --tray\n"),
+            "{entry}"
+        );
+        assert!(
+            entry.contains("TryExec=/home/u/My $Apps/100%/a\"b.AppImage\n"),
+            "{entry}"
+        );
         assert!(entry.contains("Icon=colmap-studio\n"));
     }
 
     /// Fresh, empty folder under the system temp dir, unique per test.
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("colmap-tray-test-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("colmap-tray-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1471,12 +1531,25 @@ mod tests {
         };
         write_prefs(&path, &prefs).unwrap();
         // A second write replaces the first in place.
-        write_prefs(&path, &Prefs { notify: false, ..prefs }).unwrap();
+        write_prefs(
+            &path,
+            &Prefs {
+                notify: false,
+                ..prefs
+            },
+        )
+        .unwrap();
         let loaded = load_prefs_from(&path);
         assert!(!loaded.notify);
         assert_eq!(loaded.output_parent.as_deref(), Some(Path::new("/out")));
-        assert_eq!(loaded.last_workspace.as_deref(), Some(Path::new("/out/proj")));
-        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(
+            loaded.last_workspace.as_deref(),
+            Some(Path::new("/out/proj"))
+        );
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(names, ["tray.json"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1518,7 +1591,10 @@ mod tests {
         let prefs = load_prefs_from(&path);
         assert!(!prefs.notify);
         assert!(!path.exists());
-        assert_eq!(std::fs::read_to_string(dir.join("tray.json.bad")).unwrap(), r#"{"notify":true,"output_par"#);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tray.json.bad")).unwrap(),
+            r#"{"notify":true,"output_par"#
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1566,13 +1642,28 @@ mod tests {
     fn request_wire_format() {
         // The window and the tray can be different builds (e.g. an old tray
         // still running after an update), so the JSON shape must stay put.
-        let req: Request = serde_json::from_str(r#"{"cmd":"set_output","parent":"/out","pending":null}"#).unwrap();
-        assert!(matches!(req, Request::SetOutput { ref parent, pending: None } if parent == Path::new("/out")));
-        let req: Request = serde_json::from_str(r#"{"cmd":"status","job":0,"log_from":3,"stage_from":1}"#).unwrap();
-        assert!(matches!(req, Request::Status { job: 0, log_from: 3, stage_from: 1 }));
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"set_output","parent":"/out","pending":null}"#).unwrap();
+        assert!(
+            matches!(req, Request::SetOutput { ref parent, pending: None } if parent == Path::new("/out"))
+        );
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"status","job":0,"log_from":3,"stage_from":1}"#)
+                .unwrap();
+        assert!(matches!(
+            req,
+            Request::Status {
+                job: 0,
+                log_from: 3,
+                stage_from: 1
+            }
+        ));
         let req: Request = serde_json::from_str(r#"{"cmd":"cancel","job":7}"#).unwrap();
         assert!(matches!(req, Request::Cancel { job: 7 }));
-        assert_eq!(serde_json::to_string(&Response::Started(5)).unwrap(), r#"{"Started":5}"#);
+        assert_eq!(
+            serde_json::to_string(&Response::Started(5)).unwrap(),
+            r#"{"Started":5}"#
+        );
         assert_eq!(serde_json::to_string(&Response::Ok).unwrap(), r#""Ok""#);
     }
 

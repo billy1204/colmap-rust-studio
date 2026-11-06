@@ -330,14 +330,13 @@ fn run_job(
     let _ = stage_tx.send(PipelineEvent::Started(stage.clone()));
     let mut command = reconstruction_command(&exe, &images, &workspace);
     command.current_dir(&workspace);
-    let result =
-        match job::execute(&mut command, &workspace.join("run.log"), cancel.clone(), tx) {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = stage_tx.send(PipelineEvent::Failed(stage));
-                return Err(error);
-            }
-        };
+    let result = match job::execute(&mut command, &workspace.join("run.log"), cancel.clone(), tx) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = stage_tx.send(PipelineEvent::Failed(stage));
+            return Err(error);
+        }
+    };
     if result == job::Outcome::Cancelled || cancel.load(Ordering::SeqCst) {
         let _ = stage_tx.send(PipelineEvent::Cancelled(stage));
         return Ok(JobResult::Cancelled);
@@ -431,7 +430,8 @@ impl Studio {
                         return tray::proxy(job_id, cancel, detach, tx, stage_tx);
                     }
                     Err(e) => {
-                        let _ = tx.try_send(format!("Tray unavailable ({e}); running in this window"));
+                        let _ =
+                            tx.try_send(format!("Tray unavailable ({e}); running in this window"));
                     }
                 }
                 run_job(pipeline, exe, images, workspace, cancel, tx, stage_tx)
@@ -1210,7 +1210,9 @@ impl eframe::App for Studio {
         if self.repaint_soon {
             self.repaint_soon = false;
             ctx.request_repaint();
-        } else if self.worker.is_some() || self.loader.is_some() || self.diagnostics_worker.is_some()
+        } else if self.worker.is_some()
+            || self.loader.is_some()
+            || self.diagnostics_worker.is_some()
         {
             // Elapsed clock only; new logs/stages set repaint_soon above.
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -1238,7 +1240,9 @@ impl eframe::App for Studio {
             }
             egui::Modal::new(egui::Id::new("close-during-job")).show(ui.ctx(), |ui| {
                 ui.heading("A reconstruction is running");
-                ui.label("No system tray is available, so it can't keep running without this window.");
+                ui.label(
+                    "No system tray is available, so it can't keep running without this window.",
+                );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel job and close").clicked() {
@@ -1309,8 +1313,7 @@ fn main() -> eframe::Result {
                 }
                 app.attach_running();
                 let parent = PathBuf::from(&app.output_parent);
-                let pending =
-                    project_folder(Path::new(&app.output_parent), &app.project_name).ok();
+                let pending = project_folder(Path::new(&app.output_parent), &app.project_name).ok();
                 tray::sync_output(&parent, pending.as_deref());
             }
             if let Some(path) = model {
