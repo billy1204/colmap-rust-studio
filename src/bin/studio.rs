@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use colmap_launcher::{
-    diagnostics, job, metrics, orbit, platform, ply, point_cloud, preflight,
-    reconstruction_command, rtx_pipeline, settings, sparse_models,
+    diagnostics, job, metrics,
+    orbit::Camera,
+    platform, ply, point_cloud, preflight, reconstruction_command, rtx_pipeline, settings,
+    sparse_models,
     studio_support::{
         PipelineEvent, PipelineKind, StageStatus, StageView, apply_stage_event, initial_stages,
     },
@@ -17,6 +19,8 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[path = "studio/gizmo.rs"]
+mod gizmo;
 #[cfg(target_os = "linux")]
 #[path = "studio/tray.rs"]
 mod tray;
@@ -64,11 +68,15 @@ struct Studio {
     model_path: Option<PathBuf>,
     sparse_output: Option<PathBuf>,
     loader: Option<JoinHandle<Result<point_cloud::Cloud, String>>>,
-    yaw: f32,
-    pitch: f32,
-    zoom: f32,
-    pan: Vec2,
+    camera: Camera,
+    gizmo_mode: gizmo::Mode,
+    /// Gizmo shown: right-click on the preview shows it, a left-click hides it.
+    gizmo_visible: bool,
+    /// Gizmo handle being dragged, if any.
+    gizmo_drag: Option<gizmo::Drag>,
     point_size: f32,
+    /// When "Controls help" was last clicked; the tip shows for a few seconds.
+    help_shown_at: Option<Instant>,
     projected_cache: Vec<([f32; 3], [u8; 3])>,
     projection_dirty: bool,
     /// Cached egui mesh for the point preview; rebuilt only when the view changes.
@@ -149,11 +157,12 @@ impl Default for Studio {
             model_path: None,
             sparse_output: None,
             loader: None,
-            yaw: 0.0,
-            pitch: 0.0,
-            zoom: 1.0,
-            pan: Vec2::ZERO,
+            camera: Camera::default(),
+            gizmo_mode: gizmo::Mode::default(),
+            gizmo_visible: false,
+            gizmo_drag: None,
             point_size: 1.4,
+            help_shown_at: None,
             projected_cache: Vec::new(),
             projection_dirty: true,
             mesh_cache: None,
@@ -187,6 +196,15 @@ fn fresh_workspace(parent: &Path) -> PathBuf {
         .as_millis();
     parent.join(format!("studio-run-{stamp}"))
 }
+/// Opacity of the controls tip `elapsed` after "Controls help" was clicked:
+/// fully shown for 4 s, then a short fade; None once it's gone.
+fn help_alpha(elapsed: Duration) -> Option<f32> {
+    const SHOW: f32 = 4.0;
+    const FADE: f32 = 0.8;
+    let t = elapsed.as_secs_f32();
+    (t < SHOW + FADE).then(|| (1.0 - (t - SHOW) / FADE).min(1.0))
+}
+
 fn project_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let trimmed = name.trim();
     let basename = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
@@ -681,10 +699,8 @@ impl Studio {
         }
     }
     fn reset_view(&mut self) {
-        self.yaw = 0.0;
-        self.pitch = 0.0;
-        self.zoom = 3.0;
-        self.pan = Vec2::ZERO;
+        self.camera = Camera::default();
+        self.gizmo_drag = None;
         self.projection_dirty = true;
         self.mesh_cache = None;
         self.mesh_key = None;
@@ -1069,6 +1085,34 @@ impl Studio {
                 if ui.button("Reset view").clicked() {
                     self.reset_view();
                 }
+                ui.separator();
+                for (mode, label, tip) in [
+                    (
+                        gizmo::Mode::Move,
+                        "Move",
+                        "Arrows slide the view along an axis, squares along a plane",
+                    ),
+                    (
+                        gizmo::Mode::Rotate,
+                        "Rotate",
+                        "Rings turn the view around an axis; drag inside the ball to orbit",
+                    ),
+                    (
+                        gizmo::Mode::Scale,
+                        "Scale",
+                        "Drag a handle outward to zoom in",
+                    ),
+                ] {
+                    // Picking a tool also brings the gizmo back.
+                    if ui
+                        .selectable_value(&mut self.gizmo_mode, mode, label)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.gizmo_visible = true;
+                    }
+                }
+                ui.separator();
                 if let Some(path) = self.sparse_output.clone()
                     && ui
                         .button("Sparse")
@@ -1087,7 +1131,6 @@ impl Studio {
                 }
                 ui.add(egui::Slider::new(&mut self.point_size, 0.5..=4.0).text("Point size"));
             });
-            ui.small("Left-drag: orbit   •   Right-drag: pan   •   Scroll: zoom");
             if let Some(path) = &self.model_path {
                 ui.label(RichText::new(path.display().to_string()).small());
             }
@@ -1096,26 +1139,86 @@ impl Studio {
     }
     fn paint_cloud(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size().max(Vec2::new(10.0, 10.0));
-        let (response, painter) = ui.allocate_painter(size, egui::Sense::drag());
+        let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
         let rect = response.rect;
         painter.rect_filled(rect, 6.0, Color32::from_rgb(14, 20, 29));
-        let delta = ui.input(|i| i.pointer.delta());
-        if response.dragged_by(egui::PointerButton::Primary) {
-            self.yaw += delta.x * 0.008;
-            self.pitch += delta.y * 0.008;
+        let (delta, scroll, pinch, pointer, press) = ui.input(|i| {
+            (
+                i.pointer.delta(),
+                i.smooth_scroll_delta.y,
+                i.zoom_delta(),
+                i.pointer.hover_pos(),
+                i.pointer.press_origin(),
+            )
+        });
+        let center = rect.center();
+        let scale = rect.width().min(rect.height()) * 0.85;
+        let r = gizmo::radius(rect);
+        let has_cloud = self.cloud.is_some();
+        // Right-click shows the gizmo, a left-click off its handles hides it,
+        // and left-drag works only on its handles. Middle-drag pans anywhere.
+        if has_cloud && response.secondary_clicked() {
+            self.gizmo_visible = true;
+        }
+        let gizmo_on = has_cloud && self.gizmo_visible;
+        if gizmo_on && response.drag_started_by(egui::PointerButton::Primary) {
+            self.gizmo_drag =
+                press.and_then(|pos| gizmo::hit(self.gizmo_mode, &self.camera, center, r, pos));
+        }
+        if !response.dragged() {
+            self.gizmo_drag = None;
+        }
+        if let Some(drag) = &mut self.gizmo_drag
+            && delta != Vec2::ZERO
+        {
+            gizmo::drag(drag, &mut self.camera, delta, scale, r);
             self.projection_dirty = true;
         }
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            self.pan += delta;
+        let panning = has_cloud && response.dragged_by(egui::PointerButton::Middle);
+        if panning && delta != Vec2::ZERO {
+            self.camera.pan((delta / scale).into());
+            self.projection_dirty = true;
         }
+        let hot = self.gizmo_drag.map(|d| d.handle).or_else(|| {
+            pointer
+                .filter(|_| gizmo_on && response.hovered())
+                .and_then(|pos| gizmo::hit(self.gizmo_mode, &self.camera, center, r, pos))
+                .map(|d| d.handle)
+        });
+        if panning {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+        } else if hot.is_some() {
+            ui.ctx().set_cursor_icon(if self.gizmo_drag.is_some() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+        // Scroll or pinch zooms toward the point under the cursor.
         if response.hovered() {
-            let old_zoom = self.zoom;
-            self.zoom = (self.zoom * (ui.input(|i| i.smooth_scroll_delta.y) * 0.002).exp())
-                .clamp(0.1, 10.0);
-            self.projection_dirty |= self.zoom != old_zoom;
+            let cam = &mut self.camera;
+            let old_zoom = cam.zoom;
+            cam.zoom = (cam.zoom * (scroll * 0.002).exp() * pinch).clamp(0.1, 10.0);
+            if cam.zoom != old_zoom {
+                if let Some(pos) = pointer {
+                    let cursor = ((pos - center) / scale).into();
+                    let after = cam.screen_to_world(cursor);
+                    let before = Camera {
+                        zoom: old_zoom,
+                        ..*cam
+                    }
+                    .screen_to_world(cursor);
+                    cam.target = std::array::from_fn(|i| cam.target[i] + before[i] - after[i]);
+                }
+                self.projection_dirty = true;
+            }
         }
-        let center = rect.center() + self.pan;
-        let scale = rect.width().min(rect.height()) * 0.85;
+        if response.clicked() && hot.is_none() {
+            self.gizmo_visible = false;
+        }
+        if response.double_clicked() && hot.is_none() {
+            self.reset_view();
+        }
         let key = MeshKey {
             center: [center.x, center.y],
             scale,
@@ -1125,12 +1228,9 @@ impl Studio {
         if let Some(cloud) = &self.cloud {
             if self.projection_dirty {
                 self.projected_cache.clear();
-                self.projected_cache.extend(cloud.points.iter().map(|p| {
-                    (
-                        orbit::project(p.xyz, self.yaw, self.pitch, self.zoom),
-                        p.rgb,
-                    )
-                }));
+                let cam = self.camera;
+                self.projected_cache
+                    .extend(cloud.points.iter().map(|p| (cam.project(p.xyz), p.rgb)));
                 self.projected_cache
                     .sort_unstable_by(|a, b| b.0[2].total_cmp(&a.0[2]));
                 self.projection_dirty = false;
@@ -1153,10 +1253,16 @@ impl Studio {
             if let Some(mesh) = &self.mesh_cache {
                 painter.add(egui::Shape::mesh(mesh.clone()));
             }
+            if gizmo_on {
+                gizmo::paint(&painter, self.gizmo_mode, &self.camera, center, r, hot);
+            }
             painter.text(
                 rect.left_top() + Vec2::splat(14.0),
                 egui::Align2::LEFT_TOP,
-                format!("{} points   •   zoom {:.1}×", cloud.total_points, self.zoom),
+                format!(
+                    "{} points   •   zoom {:.1}×",
+                    cloud.total_points, self.camera.zoom
+                ),
                 egui::FontId::monospace(12.0),
                 Color32::from_gray(180),
             );
@@ -1172,6 +1278,69 @@ Build a reconstruction or open points3D.bin / fused.ply
 Sparse and dense previews remain point clouds — not solid meshes",
                 egui::FontId::proportional(18.0),
                 Color32::from_gray(160),
+            );
+        }
+        self.controls_help(ui, rect);
+    }
+
+    /// "Controls help" button fixed in the preview's bottom-right corner.
+    /// Clicking it shows a short list of controls above it for a few
+    /// seconds, then the list fades away; the button stays.
+    fn controls_help(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        const CONTROLS: [(&str, &str); 3] = [
+            ("Scroll", "Zoom"),
+            ("Middle-drag", "Pan"),
+            ("Right-click", "Rotate (shows the gizmo)"),
+        ];
+        let size = Vec2::new(116.0, 24.0);
+        let button =
+            egui::Rect::from_min_size(rect.right_bottom() - size - Vec2::splat(10.0), size);
+        if ui.put(button, egui::Button::new("Controls help")).clicked() {
+            self.help_shown_at = Some(Instant::now());
+        }
+        let Some(alpha) = self.help_shown_at.and_then(|t| help_alpha(t.elapsed())) else {
+            self.help_shown_at = None;
+            return;
+        };
+        ui.ctx().request_repaint();
+        let painter = ui.painter_at(rect);
+        let font = egui::FontId::proportional(14.0);
+        let fade = |c: Color32| c.gamma_multiply(alpha);
+        let rows: Vec<_> = CONTROLS
+            .iter()
+            .map(|(input, action)| {
+                (
+                    painter.layout_no_wrap(input.to_string(), font.clone(), fade(Color32::WHITE)),
+                    painter.layout_no_wrap(
+                        action.to_string(),
+                        font.clone(),
+                        fade(Color32::from_gray(200)),
+                    ),
+                )
+            })
+            .collect();
+        let key_w = rows.iter().map(|(k, _)| k.size().x).fold(0.0, f32::max);
+        let act_w = rows.iter().map(|(_, a)| a.size().x).fold(0.0, f32::max);
+        let (gap, pad, line) = (14.0, 10.0, 20.0);
+        let panel_size = Vec2::new(
+            key_w + gap + act_w + pad * 2.0,
+            line * rows.len() as f32 + pad * 2.0 - 4.0,
+        );
+        let panel = egui::Rect::from_min_size(
+            egui::pos2(
+                button.max.x - panel_size.x,
+                button.min.y - 8.0 - panel_size.y,
+            ),
+            panel_size,
+        );
+        painter.rect_filled(panel, 6.0, fade(Color32::from_black_alpha(215)));
+        for (row, (key, action)) in rows.into_iter().enumerate() {
+            let y = panel.min.y + pad + line * row as f32;
+            painter.galley(egui::pos2(panel.min.x + pad, y), key, Color32::WHITE);
+            painter.galley(
+                egui::pos2(panel.min.x + pad + key_w + gap, y),
+                action,
+                Color32::WHITE,
             );
         }
     }
@@ -1387,15 +1556,23 @@ mod tests {
     }
 
     #[test]
+    fn controls_tip_shows_for_four_seconds_then_fades() {
+        assert_eq!(help_alpha(Duration::ZERO), Some(1.0));
+        assert_eq!(help_alpha(Duration::from_millis(3900)), Some(1.0));
+        let fading = help_alpha(Duration::from_millis(4400)).unwrap();
+        assert!(fading > 0.0 && fading < 1.0);
+        assert_eq!(help_alpha(Duration::from_secs(5)), None);
+    }
+
+    #[test]
     fn reset_restores_orbit_pan_and_useful_zoom() {
         let mut app = Studio::default();
-        app.yaw = 10.0;
-        app.pitch = 3.0;
-        app.pan = Vec2::splat(100.0);
-        app.zoom = 9.0;
+        app.camera.orbit(1.0, 0.5);
+        app.camera.target = [0.5, -0.2, 0.3];
+        app.camera.zoom = 9.0;
         app.reset_view();
-        assert_eq!((app.yaw, app.pitch, app.zoom), (0.0, 0.0, 3.0));
-        assert_eq!(app.pan, Vec2::ZERO);
+        assert_eq!(app.camera, Camera::default());
+        assert_eq!(app.camera.zoom, 3.0);
     }
     #[test]
     fn start_rejects_invalid_inputs_without_creating_workspace() {

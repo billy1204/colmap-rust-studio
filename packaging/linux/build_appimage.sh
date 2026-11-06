@@ -14,4 +14,9 @@ ln -s colmap-studio.png "$APPDIR/.DirIcon"
 install -Dm644 packaging/linux/colmap-studio.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/colmap-studio.svg"
 install -Dm644 packaging/linux/colmap-studio.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/colmap-studio.png"
 install -Dm644 packaging/linux/colmap-studio.desktop "$APPDIR/usr/share/applications/colmap-studio.desktop"
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$TOOL" --no-appstream "$APPDIR" COLMAP-Rust-Studio-x86_64.AppImage
+# Build beside the old AppImage and rename over it: it may be running, and a
+# running executable can be replaced but not rewritten in place.
+OUT=COLMAP-Rust-Studio-x86_64.AppImage
+rm -f "$OUT.tmp"
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$TOOL" --no-appstream "$APPDIR" "$OUT.tmp"
+mv -f "$OUT.tmp" "$OUT"
