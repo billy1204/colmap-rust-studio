@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use colmap_launcher::{
     diagnostics, job, metrics,
-    orbit::Camera,
+    orbit::{self, Camera},
     platform, ply, point_cloud, preflight, reconstruction_command, rtx_pipeline, settings,
     sparse_models,
     studio_support::{
@@ -82,6 +82,8 @@ struct Studio {
     help_shown_at: Option<Instant>,
     projected_cache: Vec<([f32; 3], [u8; 3])>,
     projection_dirty: bool,
+    /// Whether `projected_cache` is in far-to-near order.
+    depth_sorted: bool,
     /// Cached egui mesh for the point preview; rebuilt only when the view changes.
     mesh_cache: Option<std::sync::Arc<egui::Mesh>>,
     mesh_key: Option<MeshKey>,
@@ -168,6 +170,7 @@ impl Default for Studio {
             help_shown_at: None,
             projected_cache: Vec::new(),
             projection_dirty: true,
+            depth_sorted: false,
             mesh_cache: None,
             mesh_key: None,
             repaint_soon: false,
@@ -1268,6 +1271,7 @@ impl Studio {
             });
         }
         // Scroll or pinch zooms toward the point under the cursor.
+        let mut zoomed = false;
         if response.hovered() {
             let cam = &mut self.camera;
             let old_zoom = cam.zoom;
@@ -1284,6 +1288,7 @@ impl Studio {
                     cam.target = std::array::from_fn(|i| cam.target[i] + before[i] - after[i]);
                 }
                 self.projection_dirty = true;
+                zoomed = true;
             }
         }
         if response.clicked() && hot.is_none() {
@@ -1298,16 +1303,42 @@ impl Studio {
             point_size: self.point_size,
             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
         };
+        let moving = self.gizmo_drag.is_some() || panning || zoomed;
+        if self
+            .mesh_key
+            .is_some_and(|k| k.rect != key.rect || k.scale != key.scale)
+        {
+            self.projection_dirty = true;
+        }
         if let Some(cloud) = &self.cloud {
             if self.projection_dirty {
-                self.projected_cache.clear();
+                // Keep only points in front of the eye and inside the view.
+                let margin = self.point_size / scale;
+                let half_w = rect.width() / 2.0 / scale + margin;
+                let half_h = rect.height() / 2.0 / scale + margin;
                 let cam = self.camera;
+                self.projected_cache.clear();
                 self.projected_cache
-                    .extend(cloud.points.iter().map(|p| (cam.project(p.xyz), p.rgb)));
-                self.projected_cache
-                    .sort_unstable_by(|a, b| b.0[2].total_cmp(&a.0[2]));
+                    .extend(cloud.points.iter().filter_map(|p| {
+                        let s = cam.project(p.xyz);
+                        (orbit::in_front(s) && s[0].abs() <= half_w && s[1].abs() <= half_h)
+                            .then_some((s, p.rgb))
+                    }));
                 self.projection_dirty = false;
+                self.depth_sorted = false;
                 self.mesh_cache = None;
+            }
+            // Far-to-near order lets near points cover far ones. Sorting is
+            // the slowest step, so it waits until the view stops moving.
+            if !self.depth_sorted {
+                if moving {
+                    ui.ctx().request_repaint();
+                } else {
+                    self.projected_cache
+                        .sort_unstable_by(|a, b| b.0[2].total_cmp(&a.0[2]));
+                    self.depth_sorted = true;
+                    self.mesh_cache = None;
+                }
             }
             if self.mesh_key != Some(key) || self.mesh_cache.is_none() {
                 let mut mesh = egui::Mesh::default();

@@ -69,14 +69,27 @@ impl Camera {
     }
 }
 
+/// Distance from the eye to the target, in cloud units.
+const EYE: f32 = 4.0;
+
+/// Points nearer the eye than this are not drawn.
+const NEAR: f32 = 0.25;
+
 /// Screen units per cloud unit at the target's depth.
 pub fn pivot_scale(zoom: f32) -> f32 {
-    1.8 * zoom.clamp(0.1, 10.0) / 4.0
+    1.8 * zoom.clamp(0.1, 10.0) / EYE
+}
+
+/// Whether a projected point (from `Camera::project`) is far enough in
+/// front of the eye to draw. Points at or behind the eye would otherwise
+/// show up enlarged in the wrong place.
+pub fn in_front(projected: [f32; 3]) -> bool {
+    EYE + projected[2] >= NEAR
 }
 
 /// Perspective projection of a camera-space point.
 fn project(c: [f32; 3], zoom: f32) -> [f32; 3] {
-    let scale = 1.8 * zoom.clamp(0.1, 10.0) / (4.0 + c[2]).max(0.1);
+    let scale = 1.8 * zoom.clamp(0.1, 10.0) / (EYE + c[2]).max(0.1);
     [c[0] * scale, -c[1] * scale, c[2]]
 }
 
@@ -216,6 +229,19 @@ mod tests {
         let point = cam.target;
         cam.pan([0.07, -0.03]);
         assert!(close(screen(&cam, point), [0.07, -0.03]));
+    }
+
+    #[test]
+    fn points_at_or_behind_the_eye_are_not_drawn() {
+        // Move the view center back so the eye sits inside the cloud, at z = -0.5.
+        let cam = Camera {
+            target: [0.0, 0.0, 3.5],
+            ..Camera::default()
+        };
+        assert!(in_front(cam.project([0.0, 0.0, 1.0])));
+        assert!(!in_front(cam.project([0.0, 0.0, -0.4])));
+        assert!(!in_front(cam.project([0.3, 0.2, -1.0])));
+        assert!(in_front(Camera::default().project([1.0, 1.0, -1.0])));
     }
 
     #[test]

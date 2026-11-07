@@ -14,7 +14,7 @@ pub struct Point {
 }
 
 pub fn load(path: &Path) -> Result<Cloud, String> {
-    use std::io::{BufReader, Seek, SeekFrom};
+    use std::io::BufReader;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file() {
@@ -32,6 +32,8 @@ pub fn load(path: &Path) -> Result<Cloud, String> {
     }
     let keep = total_points.min(100_000);
     let mut retained = Vec::with_capacity(keep as usize);
+    // Read position, tracked here: asking the reader costs a system call.
+    let mut position = 8u64;
     for index in 0..total_points {
         let _id = read_bytes::<8>(&mut reader)?;
         let mut xyz = [0.; 3];
@@ -45,23 +47,23 @@ pub fn load(path: &Path) -> Result<Cloud, String> {
         let _error = read_bytes::<8>(&mut reader)?;
         let tracks = u64::from_le_bytes(read_bytes(&mut reader)?);
         let track_bytes = tracks.checked_mul(8).ok_or("Track length overflow")?;
-        let end = reader
-            .stream_position()
-            .map_err(|e| e.to_string())?
+        let end = (position + 51)
             .checked_add(track_bytes)
             .ok_or("Track offset overflow")?;
         if end > file_len {
             return Err("Truncated track data".into());
         }
+        // Skips within the read buffer when it can, unlike a plain seek.
         reader
-            .seek(SeekFrom::Start(end))
+            .seek_relative(track_bytes as i64)
             .map_err(|e| e.to_string())?;
+        position = end;
         let next = retained.len() as u64;
         if next < keep && (keep == 1 || index == next * (total_points - 1) / (keep - 1)) {
             retained.push((xyz, rgb));
         }
     }
-    if reader.stream_position().map_err(|e| e.to_string())? != file_len {
+    if position != file_len {
         return Err("Unexpected trailing bytes in points3D.bin".into());
     }
     normalized_cloud(retained, total_points)
