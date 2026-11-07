@@ -123,9 +123,13 @@ struct MeshKey {
 }
 impl Default for Studio {
     fn default() -> Self {
-        let samples = platform::default_samples_root();
-        let initial_workspace = fresh_workspace(&samples);
-        let saved = settings::load(&settings::default_path()).unwrap_or_default();
+        let saved = settings::load(&settings_path()).unwrap_or_default();
+        let output_parent = saved
+            .output_parent
+            .clone()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(platform::default_projects_root);
+        let initial_workspace = fresh_workspace(&output_parent);
         let install = if saved.install.as_os_str().is_empty() {
             platform::default_install()
         } else {
@@ -134,14 +138,9 @@ impl Default for Studio {
         Self {
             install: install.display().to_string(),
             colmap_search: None,
-            images: samples
-                .join("south-building")
-                .join("south-building")
-                .join("images")
-                .display()
-                .to_string(),
+            images: String::new(),
             workspace: initial_workspace.display().to_string(),
-            output_parent: samples.display().to_string(),
+            output_parent: output_parent.display().to_string(),
             project_name: initial_workspace
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -191,6 +190,22 @@ impl Default for Studio {
             detach: Arc::new(AtomicBool::new(false)),
             close_prompt: false,
         }
+    }
+}
+/// Studio's settings file. Each test thread gets a private one, so tests
+/// never touch the user's real settings or each other's.
+fn settings_path() -> PathBuf {
+    if cfg!(test) {
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+        std::env::temp_dir()
+            .join(format!(
+                "colmap-studio-test-{}-{thread}",
+                std::process::id()
+            ))
+            .join("settings.json")
+    } else {
+        settings::default_path()
     }
 }
 fn fresh_workspace(parent: &Path) -> PathBuf {
@@ -255,9 +270,13 @@ fn project_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(parent.join(trimmed))
 }
 
-fn folder_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+/// A folder path with a Browse button. Returns true when the user commits a
+/// new value: picks a folder, or leaves the text box after typing.
+fn folder_field(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     ui.label(RichText::new(label).strong());
-    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+    let mut committed = ui
+        .add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
+        .lost_focus();
     if ui.button(format!("Browse {label}…")).clicked() {
         let mut picker = rfd::FileDialog::new().set_title(label);
         if Path::new(value).is_dir() {
@@ -265,9 +284,11 @@ fn folder_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
         }
         if let Some(path) = picker.pick_folder() {
             *value = path.display().to_string();
+            committed = true;
         }
     }
     ui.add_space(12.0);
+    committed
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -414,6 +435,11 @@ impl Studio {
         if self.worker.is_some() || self.loader.is_some() {
             return;
         }
+        if self.images.trim().is_empty() {
+            self.status = "Error: choose a photo folder first".into();
+            return;
+        }
+        self.remember_output_parent();
         let requested_workspace =
             match project_folder(Path::new(&self.output_parent), &self.project_name) {
                 Ok(path) => path,
@@ -753,7 +779,18 @@ impl Studio {
                 .unwrap_or_default()
                 .as_secs(),
         });
-        if let Err(error) = settings::save_atomic(&settings::default_path(), &self.settings) {
+        if let Err(error) = settings::save_atomic(&settings_path(), &self.settings) {
+            self.logs.push_back(format!("Settings warning: {error}"));
+        }
+    }
+    /// Keep the chosen output parent folder as the default for next time.
+    fn remember_output_parent(&mut self) {
+        let parent = PathBuf::from(self.output_parent.trim());
+        if parent.as_os_str().is_empty() || self.settings.output_parent.as_ref() == Some(&parent) {
+            return;
+        }
+        self.settings.output_parent = Some(parent);
+        if let Err(error) = settings::save_atomic(&settings_path(), &self.settings) {
             self.logs.push_back(format!("Settings warning: {error}"));
         }
     }
@@ -878,7 +915,9 @@ impl Studio {
                     ui.label(RichText::new("2  NAME THE PROJECT").strong().size(11.0));
                     ui.label("Project name");
                     ui.add(egui::TextEdit::singleline(&mut self.project_name).desired_width(f32::INFINITY));
-                    folder_field(ui, "Output parent folder", &mut self.output_parent);
+                    if folder_field(ui, "Output parent folder", &mut self.output_parent) {
+                        self.remember_output_parent();
+                    }
                     match project_folder(Path::new(&self.output_parent), &self.project_name) {
                         Ok(path) => {
                             let next = path.display().to_string();
@@ -1581,12 +1620,36 @@ mod tests {
     #[test]
     fn start_rejects_invalid_project_name_without_using_stale_workspace() {
         let mut app = Studio::default();
+        app.images = "photos".into();
         app.project_name = "CON".into();
         app.workspace = "C:/stale-valid-project".into();
         app.start();
         assert!(app.worker.is_none());
         assert!(app.status.starts_with("Error:"));
         assert_eq!(app.workspace, "C:/stale-valid-project");
+    }
+
+    #[test]
+    fn photo_folder_starts_blank_and_must_be_chosen() {
+        let mut app = Studio::default();
+        assert_eq!(app.images, "");
+        app.start();
+        assert!(app.worker.is_none());
+        assert_eq!(app.status, "Error: choose a photo folder first");
+    }
+
+    #[test]
+    fn chosen_output_folder_becomes_the_default() {
+        let fresh = Studio::default();
+        assert_eq!(
+            PathBuf::from(&fresh.output_parent),
+            platform::default_projects_root()
+        );
+        let mut app = Studio::default();
+        app.output_parent = "/tmp/my-colmap-projects".into();
+        app.remember_output_parent();
+        assert_eq!(Studio::default().output_parent, "/tmp/my-colmap-projects");
+        let _ = std::fs::remove_dir_all(settings_path().parent().unwrap());
     }
 
     #[test]

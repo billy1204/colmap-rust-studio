@@ -68,7 +68,7 @@ colmap -h | head -1   # should say "with CUDA"
 
 ## Linux behaviour notes
 - Each COLMAP run starts in its own process group. Cancel (or closing the window during a run) sends `SIGTERM` to the whole group, then `SIGKILL` after 3 seconds. The child also gets `SIGTERM` if the studio's worker dies unexpectedly (`PR_SET_PDEATHSIG`).
-- Settings live in `$XDG_CONFIG_HOME/colmap-rust-studio/settings.json` (default `~/.config/...`). Default projects go to `~/Documents/COLMAP Tests`.
+- Settings live in `$XDG_CONFIG_HOME/colmap-rust-studio/settings.json` (default `~/.config/...`). Default projects go to `~/Documents/COLMAP Projects`; the output folder you choose is remembered.
 - "Open output" and "Open full log" use `xdg-open`; "Reveal PLY" opens the containing folder.
 - Free disk space comes from `statvfs`, GPU info from `nvidia-smi`.
 - If the window can't create an OpenGL/EGL context on Wayland with the NVIDIA driver, try XWayland: `WAYLAND_DISPLAY= ./colmap-studio`.

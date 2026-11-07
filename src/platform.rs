@@ -31,6 +31,11 @@ pub fn default_samples_root() -> PathBuf {
     home_dir().join("Documents").join("COLMAP Tests")
 }
 
+/// Default parent folder for new studio projects.
+pub fn default_projects_root() -> PathBuf {
+    home_dir().join("Documents").join("COLMAP Projects")
+}
+
 /// Search `PATH` for an executable file.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;

@@ -18,6 +18,8 @@ pub struct RecentProject {
 pub struct Settings {
     pub install: PathBuf,
     pub recent: Vec<RecentProject>,
+    /// Output parent folder the user last chose.
+    pub output_parent: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,6 +27,8 @@ struct SettingsFile {
     version: u32,
     install: PathBuf,
     recent: Vec<RecentProject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_parent: Option<PathBuf>,
 }
 
 impl Settings {
@@ -66,6 +70,7 @@ pub fn save_atomic(path: &Path, settings: &Settings) -> Result<(), String> {
         version: SETTINGS_VERSION,
         install: settings.install.clone(),
         recent: settings.recent.clone(),
+        output_parent: settings.output_parent.clone(),
     })
     .map_err(|e| format!("Cannot encode settings: {e}"))?;
     let mut file = fs::File::create(&temp).map_err(|e| format!("Cannot create settings: {e}"))?;
@@ -90,6 +95,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     Ok(Settings {
         install: file.install,
         recent: file.recent.into_iter().take(MAX_RECENT).collect(),
+        output_parent: file.output_parent,
     })
 }
 
@@ -160,6 +166,7 @@ mod tests {
         let mut s = Settings {
             install: PathBuf::from("engine"),
             recent: Vec::new(),
+            output_parent: Some(PathBuf::from("projects")),
         };
         s.record(RecentProject {
             workspace: PathBuf::from("project"),
@@ -171,6 +178,17 @@ mod tests {
         let read = load(&path).unwrap();
         assert_eq!(read.install, s.install);
         assert_eq!(read.recent, s.recent);
+        assert_eq!(read.output_parent, s.output_parent);
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn settings_without_an_output_folder_still_load() {
+        let path =
+            std::env::temp_dir().join(format!("colmap-settings-old-{}.json", std::process::id()));
+        fs::write(&path, r#"{"version":1,"install":"engine","recent":[]}"#).unwrap();
+        let read = load(&path).unwrap();
+        assert_eq!(read.install, PathBuf::from("engine"));
+        assert_eq!(read.output_parent, None);
         let _ = fs::remove_file(path);
     }
 }
